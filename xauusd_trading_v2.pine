@@ -1,0 +1,254 @@
+// Noro's Bands Scalper v1.6 (Noro, 2018), adapted with explicit risk management.
+//@version=6
+strategy("XAUUSD Trading v2", shorttitle = "XAUUSD v2", overlay = true,
+     initial_capital = 100000, currency = currency.USD, pyramiding = 0,
+     default_qty_type = strategy.fixed, default_qty_value = 1,
+     commission_type = strategy.commission.percent, commission_value = 0.005, slippage = 3,
+     margin_long = 100, margin_short = 100, process_orders_on_close = false,
+     calc_on_order_fills = false, calc_on_every_tick = false, use_bar_magnifier = true)
+
+const string G_NORO = "1. Noro / entry"
+const string G_FILTER = "2. Filter kualitas"
+const string G_RISK = "3. SL / target / BEP"
+const string G_SIZE = "4. Ukuran posisi / biaya"
+const string G_GUARD = "5. Batas trading"
+const string G_VIEW = "6. Tampilan"
+
+bool allowLong = input.bool(true, "Long", group = G_NORO)
+bool allowShort = input.bool(true, "Short", group = G_NORO)
+int length = input.int(20, "Period bands", minval = 2, maxval = 200, group = G_NORO)
+int trendBars = input.int(1, "Trend bars", minval = 1, maxval = 5, group = G_NORO)
+int bodyLength = input.int(10, "Body length", minval = 0, maxval = 50, group = G_NORO)
+bool confirmEntry = input.bool(true, "Tunggu candle konfirmasi setelah pullback", group = G_NORO)
+int setupExpiry = input.int(3, "Batas tunggu konfirmasi (bar)", minval = 1, maxval = 10, group = G_NORO)
+
+bool useEma = input.bool(true, "Filter EMA dan kemiringannya", group = G_FILTER)
+int emaLength = input.int(100, "EMA trend", minval = 20, maxval = 300, group = G_FILTER)
+bool useAdx = input.bool(true, "Filter ADX", group = G_FILTER)
+float minAdx = input.float(18, "ADX minimum (DI14 / smoothing14)", minval = 5, maxval = 50, group = G_FILTER)
+float maxCandleAtr = input.float(2.5, "Range candle maksimum / ATR sebelumnya", minval = 1, maxval = 5, group = G_FILTER)
+
+int atrLength = input.int(14, "ATR length", minval = 2, group = G_RISK)
+float stopAtr = input.float(1.5, "Jarak SL minimum / ATR", minval = 0.5, maxval = 5, step = 0.1, group = G_RISK)
+float maxStopAtr = input.float(3.5, "Tolak SL lebih besar dari ATR x", minval = 1, maxval = 10, step = 0.1, group = G_RISK)
+float targetR = input.float(2.0, "Target profit (R), seluruh posisi", minval = 1, maxval = 6, step = 0.1, group = G_RISK)
+bool useBe = input.bool(true, "Aktifkan BEP otomatis", group = G_RISK)
+float beTriggerR = input.float(1.0, "BEP setelah profit CLOSE mencapai R", minval = 0.5, maxval = 3, step = 0.1, group = G_RISK)
+int beExtraTicks = input.int(2, "Buffer BEP tambahan (tick)", minval = 0, group = G_RISK)
+bool useTrail = input.bool(false, "Trailing ATR setelah BEP", group = G_RISK)
+float trailStartR = input.float(1.5, "Mulai trailing pada R", minval = 0.5, maxval = 5, step = 0.1, group = G_RISK)
+float trailAtr = input.float(1.5, "Jarak trailing / ATR", minval = 0.5, maxval = 5, step = 0.1, group = G_RISK)
+bool useNoroExit = input.bool(false, "Exit profit ala Noro setelah minimum 1R", group = G_RISK)
+int maxHoldBars = input.int(0, "Time exit (bar, 0 = nonaktif)", minval = 0, maxval = 500, group = G_RISK)
+
+float riskPercent = input.float(0.5, "Risiko rencana per trade (% equity)", minval = 0.1, maxval = 1, step = 0.1, group = G_SIZE)
+float maxExposure = input.float(100, "Batas notional (% equity, tanpa leverage)", minval = 1, maxval = 100, group = G_SIZE)
+float qtyStepInput = input.float(0, "Step qty broker (0 = syminfo.mincontract)", minval = 0, group = G_SIZE,
+     tooltip = "Qty adalah unit kontrak TradingView, bukan otomatis lot MT4/MT5. Cocokkan dengan broker.")
+float feePercent = input.float(0.005, "Estimasi komisi per sisi (%)", minval = 0, maxval = 1, step = 0.001, group = G_SIZE,
+     tooltip = "Samakan dengan Properties > Commission. Input ini hanya untuk sizing/BEP, bukan biaya emulator.")
+int slipTicks = input.int(3, "Estimasi slippage per sisi (tick)", minval = 0, group = G_SIZE,
+     tooltip = "Samakan dengan Properties > Slippage. Spread tidak dimodelkan terpisah; gunakan estimasi biaya yang realistis.")
+
+int startDate = input.time(timestamp("01 Jan 2020 00:00 +0000"), "Mulai entri (UTC)", group = G_GUARD)
+int endDate = input.time(timestamp("01 Jan 2100 00:00 +0000"), "Akhir entri eksklusif (UTC)", group = G_GUARD)
+bool useSession = input.bool(false, "Batasi sesi entri UTC", group = G_GUARD)
+string entrySession = input.session("0700-2000", "Sesi UTC (Senin-Jumat)", group = G_GUARD)
+float dailyLossPercent = input.float(2, "Batas rugi REALISASI harian UTC (%)", minval = 0.5, maxval = 5, step = 0.5, group = G_GUARD)
+int maxDailyOrders = input.int(10, "Maksimum order entri per hari UTC", minval = 1, maxval = 30, group = G_GUARD)
+int maxLossStreak = input.int(3, "Berhenti setelah loss beruntun per hari", minval = 1, maxval = 10, group = G_GUARD)
+int cooldownBars = input.int(2, "Bar penuh cooldown setelah exit", minval = 1, maxval = 30, group = G_GUARD)
+bool showBands = input.bool(true, "Tampilkan bands / EMA", group = G_VIEW)
+bool showBackground = input.bool(true, "Latar trend Noro", group = G_VIEW)
+
+if barstate.isfirst
+    if not chart.is_standard or not timeframe.isintraday
+        runtime.error("XAUUSD Trading v2: gunakan candle standar intraday; mulai evaluasi di M5/M15.")
+    if syminfo.currency != "USD" or strategy.account_currency != "USD" or syminfo.pointvalue <= 0 or syminfo.mintick <= 0
+        runtime.error("XAUUSD Trading v2: simbol dan account currency harus USD, dengan metadata kontrak valid.")
+    if startDate >= endDate or maxStopAtr < stopAtr
+        runtime.error("Periksa urutan tanggal dan batas jarak SL.")
+    if useBe and beTriggerR >= targetR
+        runtime.error("Trigger BEP harus lebih kecil daripada target R.")
+    if useTrail and (not useBe or trailStartR < beTriggerR or trailStartR >= targetR)
+        runtime.error("Trailing memerlukan BEP dan beTriggerR <= trailStartR < targetR.")
+
+float center = (ta.highest(close, length) + ta.lowest(close, length)) / 2
+float distance = ta.sma(math.abs(close - center), length)
+float upper = center + distance
+float lower = center - distance
+float upper2 = center + 2 * distance
+float lower2 = center - 2 * distance
+bool upTrend = ta.sma(close > upper ? 1.0 : 0.0, trendBars) == 1
+bool downTrend = ta.sma(close < lower ? 1.0 : 0.0, trendBars) == 1
+var int trend = 0
+trend := downTrend and high < center ? -1 : upTrend and low > center ? 1 : trend
+
+float body = math.abs(close - open)
+float averageBody = ta.ema(body, 30) / 10 * bodyLength
+int candle = close > open ? 1 : close < open ? -1 : 0
+bool noroLong = trend == 1 and ((candle == -1 and candle[1] == -1) or (body > averageBody and candle == -1))
+bool noroShort = trend == -1 and ((candle == 1 and candle[1] == 1) or (body > averageBody and candle == 1))
+bool noroLongExit = trend == 1 and ((candle == 1 and candle[1] == 1) or close > upper)
+bool noroShortExit = trend == -1 and ((candle == -1 and candle[1] == -1) or close < lower2)
+float ema = ta.ema(close, emaLength)
+[diPlus, diMinus, adx] = ta.dmi(14, 14)
+float atr = ta.atr(atrLength)
+float recentLow = ta.lowest(low, 3)
+float recentHigh = ta.highest(high, 3)
+bool warm = not na(distance) and not na(atr[1]) and atr[1] > 0 and (not useEma or not na(ema[5])) and (not useAdx or not na(adx))
+bool quality = warm and high - low <= atr[1] * maxCandleAtr and (not useAdx or adx >= minAdx)
+bool longFilter = allowLong and (not useEma or (close > ema and ema > ema[5]))
+bool shortFilter = allowShort and (not useEma or (close < ema and ema < ema[5]))
+bool inWindow = time >= startDate and time_close < endDate
+string weekdaySession = entrySession + ":23456"
+bool currentInSession = not na(time(timeframe.period, weekdaySession, "Etc/UTC"))
+bool nextOpenInSession = not na(time(timeframe.period, weekdaySession, "Etc/UTC", bars_back = -1))
+bool inSession = not useSession or (currentInSession and nextOpenInSession)
+
+var int trackedDay = na
+var float dayStartEquity = na
+var float dayStartNet = na
+var int dailyOrders = 0
+var int losingStreak = 0
+var int seenClosed = 0
+var float seenNet = 0
+var int lastExitBar = na
+var int setupSide = 0
+var int setupBar = na
+var float setupExtreme = na
+var bool planned = false
+var int orderBar = na
+var int stopTicks = na
+var int targetTicks = na
+var float activeStop = na
+var float activeTarget = na
+var bool beArmed = false
+bool sentLong = false
+bool sentShort = false
+
+if barstate.isconfirmed
+    int day = year(time_close, "Etc/UTC") * 10000 + month(time_close, "Etc/UTC") * 100 + dayofmonth(time_close, "Etc/UTC")
+    if na(trackedDay) or day != trackedDay
+        trackedDay := day
+        dayStartEquity := nz(strategy.equity[1], strategy.initial_capital)
+        dayStartNet := nz(strategy.netprofit[1], 0)
+        dailyOrders := 0
+        losingStreak := 0
+
+    // One position, one full exit: netprofit delta includes the closed trade's fees.
+    if strategy.closedtrades > seenClosed
+        float closedNet = strategy.netprofit - seenNet
+        losingStreak := closedNet < 0 ? losingStreak + 1 : 0
+        seenClosed := strategy.closedtrades
+        seenNet := strategy.netprofit
+        lastExitBar := bar_index
+        planned := false
+        activeStop := na
+        activeTarget := na
+        beArmed := false
+
+    // A rejected market entry must not leave a stale plan or its attached exits.
+    if planned and strategy.position_size == 0 and bar_index > orderBar
+        strategy.cancel("L")
+        strategy.cancel("S")
+        strategy.cancel("L-risk")
+        strategy.cancel("S-risk")
+        planned := false
+
+    if strategy.position_size != 0
+        int side = strategy.position_size > 0 ? 1 : -1
+        float entry = strategy.position_avg_price
+        float riskDistance = stopTicks * syminfo.mintick
+        activeStop := na(activeStop) ? entry - side * riskDistance : activeStop
+        activeTarget := entry + side * targetTicks * syminfo.mintick
+        float favorableClose = side * (close - entry)
+        float feeRate = feePercent / 100
+        float beDistance = (2 * entry * feeRate + beExtraTicks * syminfo.mintick) / (1 - side * feeRate) + slipTicks * syminfo.mintick
+        float bePrice = entry + side * math.ceil(beDistance / syminfo.mintick) * syminfo.mintick
+        // Close-confirmed amendments take effect on the next tick, never earlier in this bar.
+        if useBe and favorableClose >= beTriggerR * riskDistance and favorableClose > beDistance + syminfo.mintick and side * (activeTarget - bePrice) >= syminfo.mintick
+            activeStop := side == 1 ? math.max(activeStop, bePrice) : math.min(activeStop, bePrice)
+            beArmed := true
+        if useTrail and beArmed and favorableClose >= trailStartR * riskDistance
+            float trailDistance = math.max(atr * trailAtr, syminfo.mintick)
+            float trailPrice = math.round_to_mintick(close - side * trailDistance)
+            activeStop := side == 1 ? math.max(activeStop, trailPrice) : math.min(activeStop, trailPrice)
+        if side == 1
+            strategy.exit("L-risk", "L", stop = activeStop, limit = activeTarget, comment_loss = beArmed ? "BE / Trail" : "SL", comment_profit = "TP", alert_message = "Noro: exit Long")
+        else
+            strategy.exit("S-risk", "S", stop = activeStop, limit = activeTarget, comment_loss = beArmed ? "BE / Trail" : "SL", comment_profit = "TP", alert_message = "Noro: exit Short")
+        bool noroExit = useNoroExit and favorableClose >= riskDistance and (side == 1 ? noroLongExit : noroShortExit)
+        bool timeExit = maxHoldBars > 0 and bar_index - strategy.opentrades.entry_bar_index(0) >= maxHoldBars
+        if time_close >= endDate or noroExit or timeExit
+            strategy.close(side == 1 ? "L" : "S", comment = time_close >= endDate ? "End date" : noroExit ? "Noro profit" : "Time exit", alert_message = "Noro: close posisi")
+
+    float dayPnl = strategy.netprofit - dayStartNet
+    float remainingDailyRisk = math.max(0, dayStartEquity * dailyLossPercent / 100 + math.min(dayPnl, 0))
+    bool guards = dayStartEquity > 0 and strategy.equity > 0 and remainingDailyRisk > 0 and dailyOrders < maxDailyOrders and losingStreak < maxLossStreak
+    bool cooled = na(lastExitBar) or bar_index - lastExitBar > cooldownBars
+    bool canPrepare = strategy.position_size == 0 and not planned and guards and cooled and inWindow and inSession and warm
+    if not canPrepare
+        setupSide := 0
+    else
+        if setupSide != 0 and (trend != setupSide or bar_index - setupBar > setupExpiry)
+            setupSide := 0
+        if setupSide == 0 and quality
+            if noroLong and longFilter
+                setupSide := 1
+                setupBar := bar_index
+                setupExtreme := recentLow
+            else if noroShort and shortFilter
+                setupSide := -1
+                setupBar := bar_index
+                setupExtreme := recentHigh
+        if setupSide != 0
+            setupExtreme := setupSide == 1 ? math.min(setupExtreme, low) : math.max(setupExtreme, high)
+            bool confirmed = not confirmEntry or (bar_index > setupBar and (setupSide == 1 ? candle == 1 and close > high[1] : candle == -1 and close < low[1]))
+            bool filters = quality and (setupSide == 1 ? longFilter : shortFilter)
+            if confirmed and filters
+                // Structure informs the distance; a gapped fill shifts the relative stop, not the risk distance.
+                float rawDistance = math.max(atr[1] * stopAtr, setupSide * (close - setupExtreme) + 0.1 * atr[1])
+                int plannedTicks = int(math.ceil(rawDistance / syminfo.mintick))
+                float plannedDistance = plannedTicks * syminfo.mintick
+                float feeRate = feePercent / 100
+                float costReserve = ((2 * close + plannedDistance) * feeRate + 2 * slipTicks * syminfo.mintick) * syminfo.pointvalue
+                float riskCash = math.min(strategy.equity * riskPercent / 100, remainingDailyRisk)
+                float unitRisk = plannedDistance * syminfo.pointvalue + costReserve
+                float minContract = math.max(nz(syminfo.mincontract, 1), 0.00000001)
+                float qtyStep = qtyStepInput > 0 ? math.ceil(qtyStepInput / minContract) * minContract : minContract
+                float riskQty = riskCash / unitRisk
+                float exposureQty = strategy.equity * maxExposure / 100 * 0.95 / (close * syminfo.pointvalue)
+                float qty = math.floor(math.min(riskQty, exposureQty) / qtyStep) * qtyStep
+                if plannedTicks > 0 and plannedDistance <= atr[1] * maxStopAtr and qty >= qtyStep
+                    stopTicks := plannedTicks
+                    targetTicks := int(math.ceil(plannedTicks * targetR))
+                    activeStop := na
+                    activeTarget := na
+                    beArmed := false
+                    planned := true
+                    orderBar := bar_index
+                    dailyOrders += 1
+                    // Relative brackets are submitted WITH the entry and anchor to its actual fill.
+                    if setupSide == 1
+                        strategy.entry("L", strategy.long, qty = qty, alert_message = "Noro: entry Long")
+                        strategy.exit("L-risk", "L", loss = stopTicks, profit = targetTicks, comment_loss = "SL", comment_profit = "TP", alert_message = "Noro: exit Long")
+                        sentLong := true
+                    else
+                        strategy.entry("S", strategy.short, qty = qty, alert_message = "Noro: entry Short")
+                        strategy.exit("S-risk", "S", loss = stopTicks, profit = targetTicks, comment_loss = "SL", comment_profit = "TP", alert_message = "Noro: exit Short")
+                        sentShort := true
+                setupSide := 0
+
+plot(showBands ? upper2 : na, "High band 2", color.new(color.gray, 30))
+plot(showBands ? upper : na, "High band 1", color.gray)
+plot(showBands ? center : na, "Noro center", color.orange)
+plot(showBands ? lower : na, "Low band 1", color.gray)
+plot(showBands ? lower2 : na, "Low band 2", color.new(color.gray, 30))
+plot(showBands and useEma ? ema : na, "EMA filter", color.blue)
+bgcolor(showBackground ? (trend == 1 ? color.new(color.green, 90) : trend == -1 ? color.new(color.red, 90) : na) : na)
+plot(strategy.position_size != 0 ? activeStop : na, "SL / BEP", color.red, 2, plot.style_linebr)
+plot(strategy.position_size != 0 ? activeTarget : na, "Target", color.lime, 2, plot.style_linebr)
+plotshape(sentLong, "Order Long", shape.triangleup, location.belowbar, color.lime, size = size.tiny)
+plotshape(sentShort, "Order Short", shape.triangledown, location.abovebar, color.red, size = size.tiny)
+plot(strategy.position_size != 0 and beArmed ? 1 : 0, "BEP armed", display = display.data_window)

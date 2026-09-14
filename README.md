@@ -1,6 +1,14 @@
-# XAUUSD Active Scalper M5–M15 — Pine Script v6
+# XAUUSD — strategi Pine Script v6
 
-**Kode terbaru: [`ict_xauusd_v6.pine`](ict_xauusd_v6.pine).** Versi ini mengganti rangkaian ICT lima tahap yang sangat ketat dengan dua jalur entry lebih sederhana: **pullback EMA atau sweep-reclaim lokal, searah trend**. Tujuannya membuka lebih banyak *kesempatan setup*, bukan memaksa trade setiap candle.
+## XAUUSD Trading v2 — pengembangan Noro v1.6
+
+**Kode v2: [`xauusd_trading_v2.pine`](xauusd_trading_v2.pine).** Mempertahankan bands, trend persisten, dan pullback Noro; menambahkan SL, target 2R, BEP berbasis close 1R dengan estimasi biaya, sizing berbasis risiko, dan pembatas entry. Ini strategi terpisah, **bukan pengganti file ICT/Active Scalper**.
+
+Lihat **[analisis CSV, aturan, pemasangan, dan batas verifikasi](docs/xauusd-trading-v2.md)**. Pada CSV awal, win rate 68.88% tetapi rata-rata win/loss hanya 0.381 dan PF 1.055, dengan komisi tercatat nol. Versi baru **belum dibacktest pada OHLC broker Anda**; profit yang lebih tinggi, loss lebih sedikit, atau return 30% per bulan belum terbukti dan tidak dijamin.
+
+## XAUUSD Active Scalper M5–M15
+
+**Kode Active Scalper: [`ict_xauusd_v6.pine`](ict_xauusd_v6.pine).** Versi ini mengganti rangkaian ICT lima tahap yang sangat ketat dengan dua jalur entry lebih sederhana: **pullback EMA atau sweep-reclaim lokal, searah trend**. Tujuannya membuka lebih banyak *kesempatan setup*, bukan memaksa trade setiap candle.
 
 **Jumlah trade dan win rate baru belum dibuktikan pada empat bulan data Anda. Tidak ada jaminan setiap trade menang atau win rate >50%.** Target lebih dekat mengubah distribusi profit/rugi; win rate saja tidak cukup untuk menilai strategi.
 

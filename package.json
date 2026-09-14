@@ -7,7 +7,7 @@
   "scripts": {
     "test": "pnpm run test:contracts && pnpm run test:pine",
     "test:contracts": "python3 -m unittest discover -s tests -v",
-    "test:pine": "node tests/pine_smoke.cjs"
+    "test:pine": "node tests/pine_smoke.cjs && node tests/noro_pine_smoke.cjs"
   },
   "devDependencies": {
     "pinets": "0.9.33"
