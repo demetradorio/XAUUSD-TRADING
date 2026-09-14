@@ -7,6 +7,7 @@
   "scripts": {
     "test": "pnpm run test:contracts && pnpm run test:pine",
     "test:contracts": "python3 -m unittest discover -s tests -v",
+    "test:mt5": "python3 -m unittest discover -s tests -p 'test_mt5*.py' -v",
     "test:pine": "node tests/pine_smoke.cjs"
   },
   "devDependencies": {

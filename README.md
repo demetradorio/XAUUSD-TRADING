@@ -1,5 +1,10 @@
 # XAUUSD Active Scalper M5–M15 — Pine Script v6
 
+**EA MetaTrader 5 terpisah:** [`mt5/SuperScalper/SuperScalperEA.mq5`](mt5/SuperScalper/SuperScalperEA.mq5)
+mengadaptasi **NQ/MNQ Super Scalper enam jalur** yang dikirim pengguna, **bukan** strategi XAUUSD dua jalur di halaman ini.
+Lot tetap 0,05/0,10, default order terkunci. Baca [pemasangan, kebutuhan data, dan batas verifikasi](docs/mt5-super-scalper.md)
+sebelum mengaktifkannya; akun cent tidak otomatis membuat lot tersebut aman atau menyamakan feed MT5 dengan TradingView.
+
 **Kode terbaru: [`ict_xauusd_v6.pine`](ict_xauusd_v6.pine).** Versi ini mengganti rangkaian ICT lima tahap yang sangat ketat dengan dua jalur entry lebih sederhana: **pullback EMA atau sweep-reclaim lokal, searah trend**. Tujuannya membuka lebih banyak *kesempatan setup*, bukan memaksa trade setiap candle.
 
 **Jumlah trade dan win rate baru belum dibuktikan pada empat bulan data Anda. Tidak ada jaminan setiap trade menang atau win rate >50%.** Target lebih dekat mengubah distribusi profit/rugi; win rate saja tidak cukup untuk menilai strategi.
