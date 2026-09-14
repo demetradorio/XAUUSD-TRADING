@@ -1,0 +1,2096 @@
+//@version=6
+// XAU Scalper v3 — port of the supplied NQ/MNQ Super Scalper method.
+// MAIN / BOS / OB / RE / TRAP / OD; individual SL/TP brackets, pyramiding 20.
+// Research baseline, not an optimized or live-validated gold strategy.
+// Technical corrections and inherited limitations: docs/xau-scalper-v3.md.
+strategy("XAU Scalper v3 [BACKTEST]", overlay=true, initial_capital=15000, default_qty_type=strategy.fixed, default_qty_value=1, pyramiding=20, commission_type=strategy.commission.cash_per_contract, commission_value=0.62, slippage=2, process_orders_on_close=false, calc_on_every_tick=false, currency=currency.USD, margin_long=5, margin_short=5, max_bars_back=1000)
+
+var g1 = "1 - Signal"
+longsEnabled = input.bool(true, "Enable Long Trades", group=g1)
+ethEnabled = input.bool(true, "Enable ETH Entries", group=g1)
+adxMin = input.int(25, "ADX Minimum", group=g1, minval=1)
+var g2 = "2 - Exits"
+tpBuffer = input.float(1.0, "TP Buffer (pts)", group=g2, minval=0)
+minProfit = input.float(5.0, "Min Profit (pts)", group=g2, minval=0)
+tp1Mult = input.float(4.0, "TP1 (xATR)", group=g2, minval=0.1)
+var g3 = "3 - ICT Features"
+useORB = input.bool(true, "Opening Range Breakout", group=g3)
+useFVG = input.bool(true, "Fair Value Gaps", group=g3)
+fvgMinPct = input.float(0.3, "FVG Min (xATR)", group=g3, minval=0)
+useOTE = input.bool(true, "OTE Zone (62-79%)", group=g3)
+useBOS = input.bool(true, "BOS/MSS", group=g3)
+bosLen = input.int(10, "BOS Lookback", group=g3, minval=1, maxval=500)
+bosMinRules = input.int(0, "BOS Min Rules (0-13)", group=g3, minval=0, maxval=13)
+useSweep = input.bool(true, "Liquidity Sweep", group=g3)
+useOD = input.bool(true, "Opening Drive (8:30 CT)", group=g3, tooltip="Legacy US equity-open/data windows; not a verified economic calendar. Signals evaluated on bar close.")
+sweepLen = input.int(20, "Sweep Lookback", group=g3, minval=1, maxval=500)
+retestMinRules = input.int(2, "Retest Min Rules", group=g3, minval=0, maxval=6)
+var g5 = "5 - Liquidity"
+minRelVol = input.float(1.2, "Min Relative Volume", group=g5, minval=0)
+minAtrPts = input.float(5.0, "Min ATR (points)", group=g5, minval=0)
+var g7b = "7b - Extra Levels"
+showQQQLevels = input.bool(true, "QQQ Levels in TP/SR (legacy NQ)", group=g7b)
+qqqIncrement = input.float(5.0, "QQQ Level Spacing", group=g7b, options=[2.5, 5.0, 10.0])
+showORBMid = input.bool(true, "ORB Midline in TP/SR", group=g7b)
+showONRange = input.bool(true, "Overnight Range in TP/SR", group=g7b)
+var g7 = "7 - Profile / Divergence"
+hvbLookback = input.int(50, "HVB Lookback (bars)", group=g7, minval=2, maxval=500)
+hvbBins = input.int(15, "HVB Price Bins", group=g7, minval=3, maxval=100)
+divLookback = input.int(5, "Div Pivot Lookback", group=g7, minval=1, maxval=100)
+var g8 = "8 - Order Blocks"
+obLookback = input.int(20, "OB Lookback", group=g8, minval=1, maxval=500)
+obMinMove = input.float(1.5, "OB Min Move (xATR)", group=g8, minval=0.1)
+useOB = input.bool(true, "Detect Order Blocks", group=g8)
+useOBTrade = input.bool(true, "OB as Trade Signal", group=g8)
+obMinRules = input.int(2, "OB Min Rules (trade)", group=g8, minval=0, maxval=5)
+shortMinRules = input.int(5, "Short Min Rules (0-8)", group=g1, minval=0, maxval=8)
+
+// Session definitions intentionally retain the supplied Chicago-time model.
+f_inSession(string window) =>
+    not na(time(timeframe.period, window, "America/Chicago"))
+
+bool inRTH = f_inSession("0700-1600")
+bool inAsia = f_inSession("1600-0100")
+bool inLondon = f_inSession("0100-0400")
+bool inPreMkt = f_inSession("0400-0830")
+bool inETH = not inRTH
+bool isOpen = f_inSession("0830-0930")
+bool isLunch = f_inSession("1100-1300")
+bool isLast = f_inSession("1500-1600")
+bool isMorning = f_inSession("0930-1100")
+bool isAfternoon = f_inSession("1300-1500")
+bool isNyKZ = f_inSession("0900-1000") or f_inSession("1300-1400")
+
+atrFast = ta.atr(10)
+atrMed = ta.atr(14)
+atrSlow = ta.atr(20)
+// Select once, before regime, liquidity, and risk calculations consume ATR.
+atr = isOpen ? atrFast : isMorning ? atrFast : isLunch ? atrMed : isAfternoon ? atrMed : isLast ? atrFast : inPreMkt ? atrSlow : inLondon ? atrSlow : inAsia ? atrSlow : atrMed
+[diPlus, diMinus, adx] = ta.dmi(14, 14)
+vwapVal = ta.vwap(hlc3)
+ema9 = ta.ema(close, 9)
+ema21 = ta.ema(close, 21)
+ema100 = ta.ema(close, 100)
+ema200 = ta.ema(close, 200)
+[macdLine, macdSig, macdHist] = ta.macd(close, 12, 26, 9)
+macdBear = macdLine < macdSig and macdHist < 0
+macdBull = macdLine > macdSig and macdHist > 0
+
+var float fpPocMid = na
+var float hvbZone1 = na
+var float hvbZone2 = na
+var float hvbZone3 = na
+var float povLevel = na
+var float vahLevel = na
+var float valLevel = na
+var float pocBuyPct = 50.0
+var float pocRawBuy = 0.0
+var float pocRawSell = 0.0
+var float nodeStrength = 0.0
+var float fvgBullHi = na
+var float fvgBullLo = na
+var float fvgBearHi = na
+var float fvgBearLo = na
+var float fvgBullFill = 0.0
+var float fvgBearFill = 0.0
+var int fvgBullAge = 0
+var int fvgBearAge = 0
+var int fvgBullTouch = 0
+var int fvgBearTouch = 0
+var float obBullMid = na
+var float obBearMid = na
+var float nearSup = na
+var float nearRes = na
+var float entryAtr = na
+var float activeSl = na
+var float activeTp = na
+var int entryBar = na
+var float onHigh = na
+var float onLow = na
+
+bool isLong = strategy.position_size > 0
+bool isShort = strategy.position_size < 0
+bool isFlat = strategy.position_size == 0
+float posAvgPrice = strategy.position_avg_price
+
+// Legacy NQ intermarket inputs are retained, not assumed to predict gold.
+spyClose = request.security("SPY", timeframe.period, close, lookahead=barmerge.lookahead_off)
+[esHigh, esLow] = request.security("ES1!", timeframe.period, [high, low], lookahead=barmerge.lookahead_off)
+rocNQ = close != 0 and close[10] != 0 ? (close - close[10]) / close[10] * 100 : 0.0
+rocSPY = spyClose != 0 and spyClose[10] != 0 ? (spyClose - spyClose[10]) / spyClose[10] * 100 : 0.0
+rsSpread = rocNQ - rocSPY
+qqqClose = request.security("QQQ", timeframe.period, close, lookahead=barmerge.lookahead_off)
+float qqqRatio = qqqClose > 0 ? close / qqqClose : na
+float qqqLvlUp1 = na
+float qqqLvlUp2 = na
+float qqqLvlDn1 = na
+float qqqLvlDn2 = na
+if showQQQLevels and not na(qqqRatio) and not na(qqqClose)
+    float qUp1 = qqqIncrement * math.ceil(qqqClose / qqqIncrement)
+    float qDn1 = qqqIncrement * math.floor(qqqClose / qqqIncrement)
+    qqqLvlUp1 := qUp1 * qqqRatio
+    qqqLvlUp2 := (qUp1 + qqqIncrement) * qqqRatio
+    qqqLvlDn1 := qDn1 * qqqRatio
+    qqqLvlDn2 := (qDn1 - qqqIncrement) * qqqRatio
+
+[prevDayH, prevDayL, prevDayC, prev2DayH, prev2DayL] = request.security(syminfo.tickerid, "D", [high[1], low[1], close[1], high[2], low[2]], lookahead=barmerge.lookahead_on)
+pivotPP = (prevDayH + prevDayL + prevDayC) / 3
+pivotR1 = 2 * pivotPP - prevDayL
+pivotS1 = 2 * pivotPP - prevDayH
+pivotR2 = pivotPP + (prevDayH - prevDayL)
+pivotS2 = pivotPP - (prevDayH - prevDayL)
+bool dailyBullCont = not na(prevDayC) and not na(prev2DayH) and prevDayC > prev2DayH
+bool dailyBearCont = not na(prevDayC) and not na(prev2DayL) and prevDayC < prev2DayL
+bool dailyBullRev = not na(prevDayL) and not na(prev2DayL) and not na(prevDayC) and prevDayL < prev2DayL and prevDayC > prev2DayL
+bool dailyBearRev = not na(prevDayH) and not na(prev2DayH) and not na(prevDayC) and prevDayH > prev2DayH and prevDayC < prev2DayH
+float dailyBias = dailyBullCont ? 1.0 : dailyBullRev ? 1.0 : dailyBearCont ? -1.0 : dailyBearRev ? -1.0 : 0.0
+
+var float cumVol2 = 0.0
+var float cumVolPr = 0.0
+var float cumVolPr2 = 0.0
+isNewDay = ta.change(dayofmonth(time)) != 0
+if isNewDay
+    cumVol2 := 0.0
+    cumVolPr := 0.0
+    cumVolPr2 := 0.0
+cumVol2 += nz(volume)
+cumVolPr += hlc3 * nz(volume)
+cumVolPr2 += hlc3 * hlc3 * nz(volume)
+vwapCalc = cumVol2 > 0 ? cumVolPr / cumVol2 : close
+vwapVar = cumVol2 > 0 ? cumVolPr2 / cumVol2 - vwapCalc * vwapCalc : 0.0
+vwapStd = math.sqrt(math.max(0.0, vwapVar))
+vwapUp1 = vwapCalc + vwapStd
+vwapDn1 = vwapCalc - vwapStd
+vwapUp2 = vwapCalc + vwapStd * 2
+vwapDn2 = vwapCalc - vwapStd * 2
+
+rsiRaw = ta.rsi(close, 7)
+[bbBasis, bbUpper, bbLower] = ta.bb(close, 20, 1.5)
+kcMid = ta.ema(close, 20)
+kcUpper = kcMid + ta.atr(20) * 1.5
+kcLower = kcMid - ta.atr(20) * 1.5
+sqzOn = bbUpper < kcUpper and bbLower > kcLower
+sqzFired = sqzOn[1] and not sqzOn
+sqzHL = ta.highest(high, 20)
+sqzLL = ta.lowest(low, 20)
+sqzMidRef = math.avg(math.avg(sqzHL, sqzLL), ta.sma(close, 20))
+sqzMom = ta.linreg(close - sqzMidRef, 20, 0)
+bool momRecentBull = sqzMom > 0 and (sqzMom[1] <= 0 or sqzMom[2] <= 0 or sqzMom[3] <= 0)
+bool momRecentBear = sqzMom < 0 and (sqzMom[1] >= 0 or sqzMom[2] >= 0 or sqzMom[3] >= 0)
+float bbWidth = bbUpper - bbLower
+float bbPos = bbWidth > 0 ? (close - bbLower) / bbWidth : 0.5
+
+// Adaptive Efficiency Ratio and multi-scale R/S Hurst.
+int aerLen = 10
+float aerDisplacement = math.abs(close - close[aerLen])
+float aerPath = math.sum(math.abs(close - close[1]), aerLen)
+float aerER = aerPath != 0 ? aerDisplacement / aerPath : 0.0
+float aerMeanATR = ta.sma(atr, 50)
+float aerATRatio = aerMeanATR != 0 ? atr / aerMeanATR : 1.0
+float aerDynThresh = math.min(0.25 * aerATRatio, 0.65)
+bool aerTrending = aerER > aerDynThresh
+bool aerUptrend = aerTrending and close > close[aerLen]
+bool aerDowntrend = aerTrending and close < close[aerLen]
+bool aerNonTrending = aerER <= aerDynThresh
+bool aerChoppy = aerNonTrending and atr > aerMeanATR
+bool aerConsolidation = aerNonTrending and atr <= aerMeanATR
+float hurstRet = close - close[1]
+
+f_rs_seg(float ret, int start, int slen) =>
+    float m = 0.0
+    for i = 0 to slen - 1
+        m += nz(ret[start + i])
+    m /= slen
+    float cum = 0.0
+    float cmax = -1e10
+    float cmin = 1e10
+    float ss = 0.0
+    for i = 0 to slen - 1
+        float d = nz(ret[start + i]) - m
+        cum += d
+        cmax := math.max(cmax, cum)
+        cmin := math.min(cmin, cum)
+        ss += d * d
+    float r = cmax - cmin
+    float s = math.sqrt(ss / slen)
+    s > 0 and r > 0 ? r / s : 0.0
+
+f_hurst() =>
+    float sx = 0.0
+    float sy = 0.0
+    float sxy = 0.0
+    float sx2 = 0.0
+    int np = 0
+    // Same 50 / 25 / 13 / 6-bar scales and 1 / 2 / 3 / 8 segments as supplied.
+    for scale = 0 to 3
+        int slen = scale == 0 ? 50 : scale == 1 ? 25 : scale == 2 ? 13 : 6
+        int segments = scale == 0 ? 1 : scale == 1 ? 2 : scale == 2 ? 3 : 8
+        float rsSum = 0.0
+        int valid = 0
+        for segment = 0 to segments - 1
+            float rs = f_rs_seg(hurstRet, segment * slen, slen)
+            if rs > 0
+                rsSum += rs
+                valid += 1
+        if valid > 0
+            float lx = math.log(slen)
+            float ly = math.log(rsSum / valid)
+            sx += lx
+            sy += ly
+            sxy += lx * ly
+            sx2 += lx * lx
+            np += 1
+    float h = 0.5
+    float denom = np * sx2 - sx * sx
+    if np >= 2 and math.abs(denom) > 1e-10
+        h := (np * sxy - sx * sy) / denom
+    math.max(0.0, math.min(1.0, h))
+
+float hurst = f_hurst()
+avgVol = ta.sma(volume, 20)
+relVol = avgVol > 0 ? volume / avgVol : 1.0
+volOk = relVol >= minRelVol
+atrOk = atr >= minAtrPts
+liquidityOk = volOk and atrOk
+float csBody = math.abs(close - open)
+float csUpperWk = high - math.max(close, open)
+float csLowerWk = math.min(close, open) - low
+float csRange = high - low
+float csAvgBody = ta.sma(csBody, 14)
+bool csBullBar = close > open
+bool csBearBar = close < open
+bool csBullEngulf = csBullBar and csBearBar[1] and csBody > csAvgBody and close > open[1] and open <= close[1]
+bool csBearEngulf = csBearBar and csBullBar[1] and csBody > csAvgBody and close < open[1] and open >= close[1]
+bool csHammer = csLowerWk > csBody * 2.0 and csUpperWk < csBody * 0.3 and csBody < csAvgBody and csBody > 0
+bool csShootSt = csUpperWk > csBody * 2.0 and csLowerWk < csBody * 0.3 and csBody < csAvgBody and csBody > 0
+float csDojiFactor = isOpen ? 0.08 : f_inSession("1700-0100") ? 0.03 : isLunch ? 0.04 : 0.05
+bool csDoji = csRange > 0 and csBody < csRange * csDojiFactor
+
+// Supplied lag-zero Dickey-Fuller-style statistic (not a full lag-augmented test).
+float adfDy = close - close[1]
+float adfX = nz(close[1])
+f_adf(simple int n) =>
+    float sDy = ta.sma(adfDy, n) * n
+    float sX = ta.sma(adfX, n) * n
+    float sXY = ta.sma(adfDy * adfX, n) * n
+    float sX2 = ta.sma(adfX * adfX, n) * n
+    float sDy2 = ta.sma(adfDy * adfDy, n) * n
+    float d = n * sX2 - sX * sX
+    float g = d != 0 ? (n * sXY - sX * sDy) / d : 0.0
+    float a = (sDy - g * sX) / n
+    float sse = math.max(0, sDy2 - 2 * a * sDy - 2 * g * sXY + a * a * n + 2 * a * g * sX + g * g * sX2)
+    float se = d != 0 ? math.sqrt(math.max(0, sse / (n - 2) * n / d)) : 1.0
+    se > 0 ? g / se : 0.0
+
+float adfStat30 = f_adf(30)
+float adfStat50 = f_adf(50)
+float adfStat80 = f_adf(80)
+float adfStat = isOpen ? adfStat30 : isMorning ? adfStat30 : isLunch ? adfStat50 : isAfternoon ? adfStat50 : isLast ? adfStat30 : inPreMkt ? adfStat80 : inLondon ? adfStat80 : inAsia ? adfStat80 : adfStat50
+float adfN = isOpen ? 30.0 : isMorning ? 30.0 : isLunch ? 50.0 : isAfternoon ? 50.0 : isLast ? 30.0 : inPreMkt ? 80.0 : inLondon ? 80.0 : inAsia ? 80.0 : 50.0
+float adfCrit95 = -2.86 - 2.74 / adfN
+bool adfMeanRevert = adfStat < adfCrit95
+bool adfTrending = adfStat > -1.0
+float adfSessWtMR = isOpen ? 1.0 : isMorning ? 0.9 : isLunch ? 1.2 : isAfternoon ? 1.0 : isLast ? 0.9 : inPreMkt ? 2.5 : inLondon ? 2.0 : inAsia ? 2.0 : 1.0
+float adfSessWtTR = isOpen ? 1.0 : isMorning ? 0.9 : isLunch ? 0.7 : isAfternoon ? 0.8 : isLast ? 0.9 : inPreMkt ? 0.5 : inLondon ? 0.6 : inAsia ? 0.4 : 0.5
+float adfSessWt = adfMeanRevert ? adfSessWtMR : adfSessWtTR
+float adfRegWt = aerTrending ? 1.1 : aerChoppy ? 0.8 : 1.0
+float adfAdxWt = adx >= 35 ? 1.1 : adx < 15 ? 0.7 : 1.0
+float adfShift = (adfMeanRevert ? 0.03 : adfTrending ? -0.03 : 0.0) * adfSessWt * adfRegWt * adfAdxWt
+bool hurstPersist = hurst > 0.55 - adfShift
+bool hurstRevert = hurst < 0.45 + adfShift
+
+f_dyn(float b, float sO, float sL, float sA, float rT, float rC, float aH, float aL, float lo, float hi) =>
+    math.max(lo, math.min(hi, b + (isOpen ? sO : isMorning ? -sO * 0.3 : isLunch ? sL : isAfternoon ? sL * 0.5 : isLast ? sO * 0.3 : inPreMkt ? sA : inLondon ? sA * 0.8 : inAsia ? sA : 0.0) + (aerTrending ? rT : aerChoppy ? rC : 0.0) + (adx >= 30 ? aH : adx < 20 ? aL : 0.0)))
+f_dyn35(float b, float sO, float sL, float sA, float rT, float rC, float aH, float aL, float lo, float hi) =>
+    math.max(lo, math.min(hi, b + (isOpen ? sO : isMorning ? -sO * 0.3 : isLunch ? sL : isAfternoon ? sL * 0.5 : isLast ? sO * 0.3 : inPreMkt ? sA : inLondon ? sA * 0.8 : inAsia ? sA : 0.0) + (aerTrending ? rT : aerChoppy ? rC : 0.0) + (adx >= 35 ? aH : adx < 20 ? aL : 0.0)))
+
+// Profile state below is from the previous completed chart bar.
+float povDist = not na(povLevel) and atr > 0 ? math.abs(close - povLevel) / atr : 99.0
+bool nearPoV = povDist < (isOpen ? 0.8 : isMorning ? 0.9 : isLunch ? 1.2 : isAfternoon ? 1.0 : isLast ? 0.8 : inPreMkt ? 1.5 : inLondon ? 1.3 : inAsia ? 1.5 : 1.0)
+bool abovePoV = not na(povLevel) and close > povLevel
+bool belowPoV = not na(povLevel) and close < povLevel
+f_vrzVolMult() =>
+    sessAdj = isOpen ? 0.5 : isMorning ? -0.15 : isLunch ? -0.3 : isAfternoon ? -0.15 : isLast ? 0.2 : inPreMkt ? 0.3 : inLondon ? 0.24 : inAsia ? 0.3 : 0.0
+    regAdj = aerTrending ? 0.2 : aerChoppy ? -0.2 : 0.0
+    adxAdj = adx >= 30 ? 0.2 : adx < 20 ? -0.15 : 0.0
+    math.max(1.2, math.min(2.8, 1.8 + sessAdj + regAdj + adxAdj))
+bool isVrzBar = volume > avgVol * f_vrzVolMult() and atr > 0
+var float[] vrzHighs = array.new_float(0)
+var float[] vrzLows = array.new_float(0)
+var float[] vrzMids = array.new_float(0)
+if isVrzBar
+    array.push(vrzHighs, high)
+    array.push(vrzLows, low)
+    array.push(vrzMids, (high + low) / 2.0)
+    if array.size(vrzHighs) > 3
+        array.shift(vrzHighs)
+        array.shift(vrzLows)
+        array.shift(vrzMids)
+float vrzMid = na
+if array.size(vrzMids) > 0
+    vrzMid := array.get(vrzMids, array.size(vrzMids) - 1)
+float vrzBias = not na(vrzMid) ? (close > vrzMid ? 1.0 : close < vrzMid ? -1.0 : 0.0) : 0.0
+
+f_rsiBullFloor() =>
+    base = 55.0
+    sessAdj = isOpen ? -3.0 : isMorning ? 0.9 : isLunch ? 2.0 : isAfternoon ? 1.0 : isLast ? -0.9 : inPreMkt ? 3.0 : inLondon ? 2.4 : inAsia ? 3.0 : 0.0
+    adxAdj = adx >= 30 ? -3.0 : adx < 20 ? 3.0 : 0.0
+    regAdj = aerUptrend ? -2.0 : aerChoppy ? 3.0 : 0.0
+    math.max(48.0, math.min(62.0, base + sessAdj + adxAdj + regAdj))
+f_rsiBullCap() =>
+    base = 78.0
+    sessAdj = isOpen ? 4.0 : isMorning ? -1.2 : isLunch ? -2.0 : isAfternoon ? -1.0 : isLast ? 1.2 : inPreMkt ? -3.0 : inLondon ? -2.4 : inAsia ? -3.0 : 0.0
+    adxAdj = adx >= 35 ? 4.0 : adx >= 25 ? 2.0 : adx < 20 ? -3.0 : 0.0
+    regAdj = aerUptrend ? 3.0 : aerChoppy ? -3.0 : 0.0
+    math.max(72.0, math.min(86.0, base + sessAdj + adxAdj + regAdj))
+f_rsiBearCap() =>
+    base = 43.0
+    sessAdj = isOpen ? 3.0 : isMorning ? -0.9 : isLunch ? -2.0 : isAfternoon ? -1.0 : isLast ? 0.9 : inPreMkt ? -3.0 : inLondon ? -2.4 : inAsia ? -3.0 : 0.0
+    adxAdj = adx >= 30 ? 3.0 : adx < 20 ? -3.0 : 0.0
+    regAdj = aerDowntrend ? 3.0 : aerChoppy ? -3.0 : 0.0
+    math.max(36.0, math.min(50.0, base + sessAdj + adxAdj + regAdj))
+f_rsiBearFloor() =>
+    base = 22.0
+    sessAdj = isOpen ? -4.0 : isMorning ? 1.2 : isLunch ? 2.0 : isAfternoon ? 1.0 : isLast ? -1.2 : inPreMkt ? 3.0 : inLondon ? 2.4 : inAsia ? 3.0 : 0.0
+    adxAdj = adx >= 35 ? -4.0 : adx >= 25 ? -2.0 : adx < 20 ? 3.0 : 0.0
+    regAdj = aerDowntrend ? -3.0 : aerChoppy ? 3.0 : 0.0
+    math.max(14.0, math.min(28.0, base + sessAdj + adxAdj + regAdj))
+rsiBull = rsiRaw >= f_rsiBullFloor() and rsiRaw < f_rsiBullCap() and rsiRaw > rsiRaw[1]
+rsiBear = rsiRaw <= f_rsiBearCap() and rsiRaw > f_rsiBearFloor() and rsiRaw < rsiRaw[1]
+f_rsSpreadThresh() => f_dyn(0.1, -0.03, 0.03, 0.04, -0.02, 0.02, -0.02, 0.02, 0.04, 0.20)
+rsWeak = rsSpread < -f_rsSpreadThresh()
+rsStrong = rsSpread > f_rsSpreadThresh()
+
+f_divVolBear() => f_dyn(1.5, 0.3, -0.2, -0.3, 0.15, -0.1, 0.15, -0.1, 0.8, 2.2)
+f_divVolBull() => f_dyn(1.0, 0.2, -0.15, -0.2, 0.1, -0.1, 0.1, -0.1, 0.6, 1.8)
+f_trapFpRatio() => f_dyn(1.3, 0.3, -0.15, -0.2, 0.15, -0.1, 0.15, -0.1, 1.0, 2.0)
+f_bosVolThresh() => f_dyn(1.3, 0.3, -0.2, -0.3, 0.1, -0.1, 0.15, -0.15, 0.9, 2.0)
+f_mfiWtHi() => f_dyn(1.5, 0.3, -0.25, -0.3, 0.15, -0.1, 0.15, -0.1, 1.0, 2.2)
+f_mfiWtLo() => f_dyn(1.0, 0.2, -0.15, -0.2, 0.1, -0.1, 0.0, 0.0, 0.6, 1.5)
+f_exitVolClimax() => f_dyn(2.0, 0.5, -0.3, -0.4, 0.2, -0.2, 0.2, -0.2, 1.3, 3.0)
+f_confVolBounce() => f_dyn(1.2, 0.3, -0.2, -0.2, 0.1, -0.1, 0.0, 0.0, 0.8, 1.8)
+f_obVolThresh() => f_dyn(1.2, 0.3, -0.15, -0.2, 0.1, -0.1, 0.0, 0.0, 0.8, 1.8)
+f_eeVolThresh() => f_dyn(1.5, 0.3, -0.2, -0.3, 0.15, -0.1, 0.0, 0.0, 1.0, 2.2)
+f_mfiExhBuyThresh() => f_dyn35(80.0, 3.0, -2.0, -3.0, 2.0, -2.0, 2.0, -2.0, 72.0, 90.0)
+f_mfiExhSelThresh() => f_dyn35(20.0, -3.0, 2.0, 3.0, -2.0, 2.0, -2.0, 2.0, 10.0, 28.0)
+f_vixRiseThresh() => f_dyn(1.01, 0.02, -0.005, -0.005, 0.005, -0.005, 0.0, 0.0, 1.005, 1.05)
+f_vixFallThresh() => f_dyn(0.99, -0.02, 0.005, 0.005, -0.005, 0.005, 0.0, 0.0, 0.95, 0.995)
+f_bosBreakMult() => f_dyn(0.5, 0.15, -0.1, -0.1, 0.1, -0.05, 0.1, -0.05, 0.25, 0.8)
+
+var float rthHigh = na
+var float rthLow = na
+var float rthDevH = na
+var float rthDevL = na
+if inRTH
+    if not inRTH[1]
+        rthDevH := high
+        rthDevL := low
+    else
+        rthDevH := math.max(nz(rthDevH, high), high)
+        rthDevL := math.min(nz(rthDevL, low), low)
+if not inRTH and inRTH[1]
+    rthHigh := rthDevH
+    rthLow := rthDevL
+var float asiaHigh = na
+var float asiaLow = na
+if inAsia
+    if not inAsia[1]
+        asiaHigh := high
+        asiaLow := low
+    else
+        asiaHigh := math.max(nz(asiaHigh, high), high)
+        asiaLow := math.min(nz(asiaLow, low), low)
+var float londonHigh = na
+var float londonLow = na
+if inLondon
+    if not inLondon[1]
+        londonHigh := high
+        londonLow := low
+    else
+        londonHigh := math.max(nz(londonHigh, high), high)
+        londonLow := math.min(nz(londonLow, low), low)
+
+float volRatio = nz(aerATRatio, 1.0)
+float asiaRangeWidth = nz(asiaHigh, high) - nz(asiaLow, low)
+float londonRangeWidth = nz(londonHigh, high) - nz(londonLow, low)
+float onRangeWidth = nz(onHigh, high) - nz(onLow, low)
+float sessionRangeWidth = inAsia ? asiaRangeWidth : inLondon ? math.max(asiaRangeWidth, londonRangeWidth) : onRangeWidth
+float ethSlCap = math.max(15.0, sessionRangeWidth * 1.5)
+
+f_dynFloorSell() =>
+    base = 1.5
+    sessionAdj = isNyKZ ? 0.10 : isOpen ? 0.20 : isMorning ? 0.05 : isLunch ? -0.20 : isAfternoon ? 0.0 : isLast ? 0.10 : inAsia ? -0.15 : inLondon ? 0.05 : inPreMkt ? -0.05 : 0.0
+    regimeAdj = aerDowntrend ? 0.25 : aerConsolidation ? -0.10 : aerChoppy ? -0.20 : 0.0
+    adxAdj = adx >= 30 ? 0.10 : adx >= 20 ? 0.0 : -0.10
+    volAdj = relVol >= f_exitVolClimax() ? 0.10 : relVol >= f_mfiWtHi() ? 0.05 : relVol < f_mfiWtLo() ? -0.05 : 0.0
+    atr * math.max(0.8, math.min(2.5, base + sessionAdj + regimeAdj + adxAdj + volAdj))
+f_dynFloorLong() =>
+    base = 1.8
+    sessionAdj = isNyKZ ? 0.15 : isOpen ? 0.25 : isMorning ? 0.05 : isLunch ? -0.25 : isAfternoon ? 0.0 : isLast ? 0.10 : inAsia ? -0.20 : inLondon ? 0.05 : inPreMkt ? -0.05 : 0.0
+    regimeAdj = aerUptrend ? 0.25 : aerConsolidation ? -0.10 : aerChoppy ? -0.20 : 0.0
+    adxAdj = adx >= 30 ? 0.10 : adx >= 20 ? 0.0 : -0.10
+    volAdj = relVol >= f_exitVolClimax() ? 0.10 : relVol >= f_mfiWtHi() ? 0.05 : relVol < f_mfiWtLo() ? -0.05 : 0.0
+    atr * math.max(1.0, math.min(3.0, base + sessionAdj + regimeAdj + adxAdj + volAdj))
+f_dynSlDistLong() =>
+    base = 2.0
+    sessionAdj = isOpen ? 0.3 : isMorning ? -0.09 : isLunch ? 0.2 : isAfternoon ? 0.1 : isLast ? 0.09 : inPreMkt ? 0.2 : inLondon ? 0.15 : inAsia ? 0.25 : 0.0
+    regimeAdj = aerUptrend ? -0.20 : aerDowntrend ? 0.50 : aerConsolidation ? 0.30 : aerChoppy ? 0.80 : 0.0
+    adxAdj = adx >= 30 ? -0.10 : adx < 20 ? 0.20 : 0.0
+    volAdj = volRatio >= 1.5 ? 0.20 : volRatio < 0.8 ? -0.10 : 0.0
+    atr * math.max(1.2, math.min(3.0, base + sessionAdj + regimeAdj + adxAdj + volAdj))
+f_dynSlDistShort() =>
+    base = 2.0
+    sessionAdj = isOpen ? 0.3 : isMorning ? -0.09 : isLunch ? 0.2 : isAfternoon ? 0.1 : isLast ? 0.09 : inPreMkt ? 0.2 : inLondon ? 0.15 : inAsia ? 0.25 : 0.0
+    regimeAdj = aerDowntrend ? -0.20 : aerUptrend ? 0.50 : aerConsolidation ? 0.30 : aerChoppy ? 0.80 : 0.0
+    adxAdj = adx >= 30 ? -0.10 : adx < 20 ? 0.20 : 0.0
+    volAdj = volRatio >= 1.5 ? 0.20 : volRatio < 0.8 ? -0.10 : 0.0
+    atr * math.max(1.2, math.min(4.5, base + sessionAdj + regimeAdj + adxAdj + volAdj))
+f_dynBufLong() =>
+    base = 2.0
+    sessionAdj = isOpen ? 0.5 : isMorning ? -0.15 : isLunch ? 0.3 : isAfternoon ? 0.15 : isLast ? 0.15 : 0.0
+    volAdj = volRatio >= 1.5 ? 0.50 : volRatio < 0.8 ? -0.30 : 0.0
+    volRatio * math.max(1.0, math.min(5.0, base + sessionAdj + volAdj))
+f_dynBufShort() =>
+    base = 3.0
+    sessionAdj = isOpen ? 0.5 : isMorning ? -0.15 : isLunch ? 0.3 : isAfternoon ? 0.15 : isLast ? 0.15 : 0.0
+    volAdj = volRatio >= 1.5 ? 0.50 : volRatio < 0.8 ? -0.30 : 0.0
+    volRatio * math.max(1.0, math.min(6.0, base + sessionAdj + volAdj))
+f_dynBufETH() =>
+    base = 3.0
+    sessionAdj = inAsia ? -0.50 : inLondon ? 0.20 : inPreMkt ? 0.10 : 0.0
+    volAdj = volRatio >= 1.5 ? 0.50 : volRatio < 0.8 ? -0.30 : 0.0
+    volRatio * math.max(1.0, math.min(6.0, base + sessionAdj + volAdj))
+
+// Bounds apply to the signal close, not a guaranteed next-bar fill/loss.
+f_capSessionSlLong(float rawSl) =>
+    math.min(close - atr, math.max(close - atr * 3.0, rawSl))
+f_capSessionSlShort(float rawSl) =>
+    math.max(close + atr, math.min(close + atr * 3.0, rawSl))
+f_sessionSlLong() =>
+    float sl = na
+    if inETH
+        float sessionLow = inAsia ? nz(asiaLow, low) : inLondon ? math.min(nz(asiaLow, low), nz(londonLow, low)) : nz(onLow, low)
+        float structSl = sessionLow > 0 ? sessionLow - f_dynBufETH() : close - f_dynSlDistLong()
+        sl := math.max(math.min(structSl, close - f_dynSlDistLong()), close - ethSlCap)
+    else
+        float structSl = not na(nearSup) and nearSup < close ? nearSup - f_dynBufLong() : close - f_dynSlDistLong()
+        sl := math.min(structSl, close - f_dynSlDistLong())
+    f_capSessionSlLong(sl)
+f_sessionSlShort() =>
+    float sl = na
+    if inETH
+        float sessionHigh = inAsia ? nz(asiaHigh, high) : inLondon ? math.max(nz(asiaHigh, high), nz(londonHigh, high)) : nz(onHigh, high)
+        float structSl = sessionHigh > 0 ? sessionHigh + f_dynBufETH() : close + f_dynSlDistShort()
+        sl := math.min(math.max(structSl, close + f_dynSlDistShort()), close + ethSlCap)
+    else
+        float structSl = not na(nearRes) and nearRes > close ? nearRes + f_dynBufShort() : close + f_dynSlDistShort()
+        sl := math.max(structSl, close + f_dynSlDistShort())
+    f_capSessionSlShort(sl)
+f_sessionTpLong() => close + f_dynFloorLong() * 2.0
+f_sessionTpShort() => close - f_dynFloorSell() * 2.0
+
+// Legacy developing HTF values: lookahead_off is not a non-repainting guarantee.
+[h5f, h5s, h5c, h5mid] = request.security(syminfo.tickerid, "5", [ta.ema(close, 9), ta.ema(close, 21), close, (ta.highest(high, 20) + ta.lowest(low, 20)) / 2], lookahead=barmerge.lookahead_off)
+[h15f, h15s, h15c, h15mid] = request.security(syminfo.tickerid, "15", [ta.ema(close, 9), ta.ema(close, 21), close, (ta.highest(high, 20) + ta.lowest(low, 20)) / 2], lookahead=barmerge.lookahead_off)
+[h60f, h60s, h60c, h60mid] = request.security(syminfo.tickerid, "60", [ta.ema(close, 9), ta.ema(close, 21), close, (ta.highest(high, 20) + ta.lowest(low, 20)) / 2], lookahead=barmerge.lookahead_off)
+[h4f, h4s] = request.security(syminfo.tickerid, "240", [ta.ema(close, 9), ta.ema(close, 21)], lookahead=barmerge.lookahead_off)
+h4sep = math.abs(h4f - h4s) / close * 100
+h4notBear = h4f > h4s or h4sep < 0.5
+h4notBull = h4f < h4s or h4sep < 0.5
+htfBull = h5f > h5s and h15f > h15s and h60f > h60s and h4notBear
+htfBear = h5f < h5s and h15f < h15s and h60f < h60s and h4notBull
+trendUp = htfBull and ema9 > ema21 and ema21 > ema100 and close > vwapVal and adx > adxMin
+trendDown = htfBear and ema9 < ema21 and ema21 < ema100 and close < vwapVal and adx > adxMin
+swH = ta.highest(high, 5)[1]
+swL = ta.lowest(low, 5)[1]
+prevSwH = ta.highest(high, 5)[2]
+prevSwL = ta.lowest(low, 5)[2]
+brkL = close > swH and close[1] > prevSwH
+brkS = close < swL and close[1] < prevSwL
+longBrkClean = close > swH + atr * 0.2
+shortBrkConf = close < swL
+
+// Opening range / premarket / overnight structure.
+var float orbHigh = na
+var float orbLow = na
+var bool orbLocked = false
+var float pmHigh = na
+var float pmLow = na
+var float pmMid = na
+var float orbMid = na
+if isNewDay
+    orbHigh := na
+    orbLow := na
+    orbMid := na
+    orbLocked := false
+    pmHigh := na
+    pmLow := na
+    pmMid := na
+inPreMarket = f_inSession("0300-0830")
+inORBBuild = f_inSession("0830-0845")
+inOvernight = f_inSession("1500-0830")
+if inPreMarket
+    pmHigh := na(pmHigh) ? high : math.max(pmHigh, high)
+    pmLow := na(pmLow) ? low : math.min(pmLow, low)
+    pmMid := not na(pmHigh) and not na(pmLow) ? (pmHigh + pmLow) / 2.0 : na
+if inOvernight and not inOvernight[1]
+    onHigh := na
+    onLow := na
+if inOvernight
+    onHigh := na(onHigh) ? high : math.max(onHigh, high)
+    onLow := na(onLow) ? low : math.min(onLow, low)
+if inORBBuild and not orbLocked
+    orbHigh := na(orbHigh) ? high : math.max(orbHigh, high)
+    orbLow := na(orbLow) ? low : math.min(orbLow, low)
+if not inORBBuild and inORBBuild[1]
+    orbLocked := true
+    orbMid := not na(orbHigh) and not na(orbLow) ? (orbHigh + orbLow) / 2.0 : na
+var bool orbBrokenUp = false
+var bool orbBrokenDown = false
+if isNewDay
+    orbBrokenUp := false
+    orbBrokenDown := false
+if orbLocked and not na(orbHigh)
+    if close > orbHigh * 1.001
+        orbBrokenUp := true
+    if close < orbLow * 0.999
+        orbBrokenDown := true
+f_retestProx() =>
+    base = 0.002
+    sessAdj = isOpen ? 0.001 : isMorning ? -0.0003 : isLast ? 0.0003 : 0.0
+    regimeAdj = aerTrending ? 0.0005 : aerChoppy ? -0.0005 : 0.0
+    math.max(0.001, math.min(0.004, base + sessAdj + regimeAdj))
+float retProx = f_retestProx()
+orbRetestLong = orbBrokenUp and low <= orbHigh * (1 + retProx) and low >= orbHigh * (1 - retProx)
+orbRetestShort = orbBrokenDown and high >= orbLow * (1 - retProx) and high <= orbLow * (1 + retProx)
+bool orbWickLong = orbRetestLong and math.min(open, close) - low > math.abs(close - open) * 0.5
+bool orbWickShort = orbRetestShort and high - math.max(open, close) > math.abs(close - open) * 0.5
+bool orbFlowLong = orbRetestLong and close > open and volume > volume[1]
+bool orbFlowShort = orbRetestShort and close < open and volume > volume[1]
+orbConfirmLong = orbRetestLong and close > orbHigh and (orbWickLong or orbFlowLong)
+orbConfirmShort = orbRetestShort and close < orbLow and (orbWickShort or orbFlowShort)
+stratA_Long = useORB and orbLocked and orbConfirmLong
+stratA_Short = useORB and orbLocked and orbConfirmShort
+orbFailed = orbLocked and not na(orbHigh) and not orbBrokenUp and not orbBrokenDown
+atORBHigh = math.abs(close - orbHigh) / orbHigh < 0.003
+atORBLow = math.abs(close - orbLow) / orbLow < 0.003
+rejAtHigh = orbFailed and atORBHigh and high > orbHigh and close < orbHigh and high - close > (close - low) * 1.5
+rejAtLow = orbFailed and atORBLow and low < orbLow and close > orbLow and close - low > (high - close) * 1.5
+cleanCandle = csRange > atr * 0.3 and csBody > csRange * 0.3
+stratB_Short = useORB and rejAtHigh and cleanCandle
+stratB_Long = useORB and rejAtLow and cleanCandle
+
+// Opening Drive: retain the original time windows, not mid-bar execution.
+bool odRTHOpen = f_inSession("0830-0836")
+bool odEconData = f_inSession("0728-0733")
+bool odSecondWave = f_inSession("0900-0906")
+bool odWindow = useOD and (odRTHOpen or odEconData or odSecondWave)
+f_odVolThresh() =>
+    base = odRTHOpen ? 2.5 : odEconData ? 3.0 : odSecondWave ? 2.0 : 2.5
+    regAdj = aerTrending ? -0.3 : aerChoppy ? 0.4 : 0.0
+    adxAdj = adx >= 35 ? -0.3 : adx >= 25 ? -0.15 : adx < 15 ? 0.3 : 0.0
+    hurstAdj = hurstPersist ? -0.2 : hurstRevert ? 0.2 : 0.0
+    math.max(1.5, math.min(4.0, base + regAdj + adxAdj + hurstAdj))
+bool odVolSpike = volume > avgVol * f_odVolThresh()
+f_odBuildupThresh() =>
+    base = 1.5
+    regAdj = aerTrending ? -0.2 : aerChoppy ? 0.3 : 0.0
+    adxAdj = adx >= 30 ? -0.15 : adx < 20 ? 0.15 : 0.0
+    math.max(1.0, math.min(2.5, base + regAdj + adxAdj))
+float odPriorVol = (nz(volume[1]) + nz(volume[2])) / 2.0
+bool odVolBuildup = odPriorVol > avgVol * f_odBuildupThresh()
+f_odBodyRatioMin() =>
+    base = 0.50
+    regAdj = aerTrending ? -0.05 : aerChoppy ? 0.08 : 0.0
+    adxAdj = adx >= 35 ? -0.05 : adx < 15 ? 0.05 : 0.0
+    volAdj = relVol >= 3.0 ? -0.05 : 0.0
+    math.max(0.35, math.min(0.65, base + regAdj + adxAdj + volAdj))
+float odBodyRatio = csRange > 0 ? csBody / csRange : 0.0
+float odBodyMin = f_odBodyRatioMin()
+bool odStrongBull = close > open and odBodyRatio > odBodyMin and not csDoji
+bool odStrongBear = close < open and odBodyRatio > odBodyMin and not csDoji
+bool odPmBiasLong = not na(pmMid) ? close > pmMid : true
+bool odPmBiasShort = not na(pmMid) ? close < pmMid : true
+bool odHtfBiasLong = h60f > h60s or h15f > h15s
+bool odHtfBiasShort = h60f < h60s or h15f < h15s
+bool odPrevDayBiasLong = not na(prevDayC) and close > prevDayC
+bool odPrevDayBiasShort = not na(prevDayC) and close < prevDayC
+bool odAboveOvernightH = not na(onHigh) and close > onHigh
+bool odBelowOvernightL = not na(onLow) and close < onLow
+int odOvernightWt = aerTrending and adx >= 25 ? 2 : isOpen ? 2 : 1
+int odBuildupWt = aerChoppy ? 2 : isOpen and adx >= 25 ? 2 : 1
+int odEngulfWt = aerTrending and adx >= 30 ? 1 : aerChoppy ? 2 : isOpen ? 1 : 2
+int odSmtWt = inAsia ? 0 : isOpen and adx >= 25 ? 2 : isMorning and adx >= 25 ? 2 : isAfternoon ? 1 : aerTrending and adx >= 30 ? 2 : 1
+int odConfLongBase = (odPmBiasLong ? 1 : 0) + (odHtfBiasLong ? 1 : 0) + (odPrevDayBiasLong ? 1 : 0) + (odAboveOvernightH ? odOvernightWt : 0) + (odVolBuildup ? odBuildupWt : 0) + (csBullEngulf or csHammer ? odEngulfWt : 0)
+int odConfShortBase = (odPmBiasShort ? 1 : 0) + (odHtfBiasShort ? 1 : 0) + (odPrevDayBiasShort ? 1 : 0) + (odBelowOvernightL ? odOvernightWt : 0) + (odVolBuildup ? odBuildupWt : 0) + (csBearEngulf or csShootSt ? odEngulfWt : 0)
+f_odMinConf() =>
+    base = odRTHOpen ? 4 : odEconData ? 5 : 4
+    regAdj = aerChoppy ? 1 : aerTrending and adx >= 30 ? -1 : 0
+    hurstAdj = hurstRevert ? 1 : hurstPersist ? -1 : 0
+    math.max(3, math.min(7, base + regAdj + hurstAdj))
+bool odBuyGateEarly = odWindow and odVolSpike and odStrongBull and odConfLongBase >= f_odMinConf()
+bool odSellGateEarly = odWindow and odVolSpike and odStrongBear and odConfShortBase >= f_odMinConf()
+f_odSlLong() =>
+    base = odRTHOpen ? 0.4 : odEconData ? 0.6 : 0.4
+    regAdj = aerTrending ? -0.05 : aerChoppy ? 0.1 : 0.0
+    adxAdj = adx >= 35 ? -0.05 : adx < 15 ? 0.05 : 0.0
+    volAdj = relVol >= 4.0 ? 0.1 : 0.0
+    buffer = atr * math.max(0.2, math.min(0.8, base + regAdj + adxAdj + volAdj))
+    low - buffer
+f_odSlShort() =>
+    base = odRTHOpen ? 0.4 : odEconData ? 0.6 : 0.4
+    regAdj = aerTrending ? -0.05 : aerChoppy ? 0.1 : 0.0
+    adxAdj = adx >= 35 ? -0.05 : adx < 15 ? 0.05 : 0.0
+    volAdj = relVol >= 4.0 ? 0.1 : 0.0
+    buffer = atr * math.max(0.2, math.min(0.8, base + regAdj + adxAdj + volAdj))
+    high + buffer
+f_odTpFloor() =>
+    base = 1.5
+    regAdj = aerTrending ? 0.5 : aerChoppy ? -0.3 : 0.0
+    adxAdj = adx >= 35 ? 0.3 : adx < 15 ? -0.2 : 0.0
+    math.max(0.8, math.min(3.0, base + regAdj + adxAdj))
+f_odTpLong() =>
+    risk = close - f_odSlLong()
+    tpRR = aerTrending and adx >= 25 ? 2.5 : aerChoppy ? 1.5 : 2.0
+    target = close + risk * tpRR
+    if not na(prevDayH) and prevDayH > close and prevDayH < target
+        target := prevDayH
+    if not na(onHigh) and onHigh > close and onHigh < target
+        target := onHigh
+    if not na(pivotR1) and pivotR1 > close and pivotR1 < target
+        target := pivotR1
+    if not na(orbHigh) and orbHigh > close and orbHigh < target and orbLocked
+        target := orbHigh
+    math.max(target, close + atr * f_odTpFloor())
+f_odTpShort() =>
+    risk = f_odSlShort() - close
+    tpRR = aerTrending and adx >= 25 ? 2.5 : aerChoppy ? 1.5 : 2.0
+    target = close - risk * tpRR
+    if not na(prevDayL) and prevDayL < close and prevDayL > target
+        target := prevDayL
+    if not na(onLow) and onLow < close and onLow > target
+        target := onLow
+    if not na(pivotS1) and pivotS1 < close and pivotS1 > target
+        target := pivotS1
+    if not na(orbLow) and orbLow < close and orbLow > target and orbLocked
+        target := orbLow
+    math.min(target, close - atr * f_odTpFloor())
+
+fvgMinSize = atr * fvgMinPct
+bullFVG = useFVG and low > high[2] and low - high[2] >= fvgMinSize
+bearFVG = useFVG and high < low[2] and low[2] - high >= fvgMinSize
+if bullFVG
+    fvgBullHi := low
+    fvgBullLo := high[2]
+    fvgBullFill := 0.0
+    fvgBullAge := 0
+    fvgBullTouch := 0
+if bearFVG
+    fvgBearHi := low[2]
+    fvgBearLo := high
+    fvgBearFill := 0.0
+    fvgBearAge := 0
+    fvgBearTouch := 0
+if not na(fvgBullHi) and not na(fvgBullLo)
+    fvgBullAge += 1
+    fvgBullSize = fvgBullHi - fvgBullLo
+    if fvgBullSize > 0 and low <= fvgBullHi and low >= fvgBullLo
+        fvgBullFill := math.max(fvgBullFill, (fvgBullHi - low) / fvgBullSize)
+        fvgBullTouch += 1
+if not na(fvgBearHi) and not na(fvgBearLo)
+    fvgBearAge += 1
+    fvgBearSize = fvgBearHi - fvgBearLo
+    if fvgBearSize > 0 and high >= fvgBearLo and high <= fvgBearHi
+        fvgBearFill := math.max(fvgBearFill, (high - fvgBearLo) / fvgBearSize)
+        fvgBearTouch += 1
+f_fvgMaxAge() => isOpen ? 80 : isMorning ? 100 : isLunch ? 280 : isAfternoon ? 200 : inAsia ? 150 : aerTrending ? 120 : 200
+f_fvgMaxFill() => aerTrending ? 0.80 : aerChoppy ? 0.65 : 0.75
+f_fvgMaxTouch() => aerTrending ? 5 : aerChoppy ? 3 : 4
+int fvgMaxAge = f_fvgMaxAge()
+float fvgMaxFill = f_fvgMaxFill()
+int fvgMaxTouch = f_fvgMaxTouch()
+if not na(fvgBullHi) and (close < fvgBullLo or fvgBullAge > fvgMaxAge or fvgBullFill > fvgMaxFill or fvgBullTouch > fvgMaxTouch)
+    fvgBullHi := na
+    fvgBullLo := na
+if not na(fvgBearLo) and (close > fvgBearHi or fvgBearAge > fvgMaxAge or fvgBearFill > fvgMaxFill or fvgBearTouch > fvgMaxTouch)
+    fvgBearHi := na
+    fvgBearLo := na
+float fvgAgeDecay = isOpen ? 0.004 : isMorning ? 0.0035 : isLunch ? 0.001 : isAfternoon ? 0.002 : inAsia ? 0.003 : aerTrending ? 0.003 : 0.002
+float fvgTouchPenalty = aerTrending ? 0.12 : aerChoppy ? 0.20 : 0.15
+float fvgBullQuality = not na(fvgBullHi) ? math.max(0.0, 1.0 - fvgBullFill - fvgBullTouch * fvgTouchPenalty - fvgBullAge * fvgAgeDecay) : 0.0
+float fvgBearQuality = not na(fvgBearHi) ? math.max(0.0, 1.0 - fvgBearFill - fvgBearTouch * fvgTouchPenalty - fvgBearAge * fvgAgeDecay) : 0.0
+float fvgQualityGate = isOpen ? 0.20 : isMorning ? 0.25 : isLunch ? 0.40 : isAfternoon ? 0.30 : inAsia ? 0.35 : aerTrending and adx >= 25 ? 0.25 : aerChoppy ? 0.40 : 0.30
+swingHigh = sqzHL
+swingLow = sqzLL
+swingRange = swingHigh - swingLow
+inOTELong = useOTE and close >= swingHigh - swingRange * 0.79 and close <= swingHigh - swingRange * 0.62
+inOTEShort = useOTE and close <= swingLow + swingRange * 0.79 and close >= swingLow + swingRange * 0.62
+float oteMidLong = swingHigh - swingRange * (0.62 + 0.79) / 2.0
+float oteMidShort = swingLow + swingRange * (0.62 + 0.79) / 2.0
+
+bool obBullTradeFire = false
+bool obBearTradeFire = false
+int obBullStars = 0
+int obBearStars = 0
+float obBullSl = na
+float obBearSl = na
+if useOB and bar_index > obLookback
+    strongMoveUp = close > close[1] + atr * obMinMove and close > open and volume > avgVol * f_obVolThresh()
+    strongMoveDown = close < close[1] - atr * obMinMove and close < open and volume > avgVol * f_obVolThresh()
+    obFvgUp = low > high[2]
+    obFvgDown = high < low[2]
+    obInKZ = f_inSession("0200-0300") or isNyKZ
+    if strongMoveUp
+        for i = 1 to math.min(obLookback, bar_index - 1)
+            if close[i] < open[i]
+                obBullMid := (high[i] + low[i]) / 2.0
+                obBullStars := (htfBull ? 1 : 0) + (close < vwapVal ? 1 : 0) + (obFvgUp ? 1 : 0) + (relVol >= f_mfiWtHi() ? 1 : 0) + (obInKZ ? 1 : 0)
+                obMinDynBull = obMinRules + (inAsia ? 1 : inLondon ? 1 : inPreMkt ? 1 : isLast ? 1 : 0)
+                if useOBTrade and obBullStars >= obMinDynBull
+                    obBullTradeFire := true
+                    obBullSl := low[i] - f_dynSlDistLong() * 0.25
+                break
+    if strongMoveDown
+        for i = 1 to math.min(obLookback, bar_index - 1)
+            if close[i] > open[i]
+                obBearMid := (high[i] + low[i]) / 2.0
+                obBearStars := (htfBear ? 1 : 0) + (close > vwapVal ? 1 : 0) + (obFvgDown ? 1 : 0) + (relVol >= f_mfiWtHi() ? 1 : 0) + (obInKZ ? 1 : 0)
+                obMinDynBear = obMinRules + (inAsia ? 1 : inLondon ? 1 : inPreMkt ? 1 : isLast ? 1 : 0)
+                if useOBTrade and obBearStars >= obMinDynBear
+                    obBearTradeFire := true
+                    obBearSl := high[i] + f_dynSlDistShort() * 0.25
+                break
+
+f_nearestResAbove() =>
+    float best = close + atr * tp1Mult
+    if not na(pivotR1) and pivotR1 > close and pivotR1 < best
+        best := pivotR1
+    if not na(pivotR2) and pivotR2 > close and pivotR2 < best
+        best := pivotR2
+    if not na(pivotPP) and pivotPP > close and pivotPP < best
+        best := pivotPP
+    if not na(orbHigh) and orbLocked and orbHigh > close and orbHigh < best
+        best := orbHigh
+    if not na(pmHigh) and pmHigh > close and pmHigh < best
+        best := pmHigh
+    if not na(pmMid) and pmMid > close and pmMid < best
+        best := pmMid
+    if not na(vwapUp1) and vwapUp1 > close and vwapUp1 < best
+        best := vwapUp1
+    if not na(vwapUp2) and vwapUp2 > close and vwapUp2 < best
+        best := vwapUp2
+    if not na(fpPocMid) and fpPocMid > close and fpPocMid < best
+        best := fpPocMid
+    if showORBMid and not na(orbMid) and orbLocked and orbMid > close and orbMid < best
+        best := orbMid
+    if showONRange and not na(onHigh) and onHigh > close and onHigh < best
+        best := onHigh
+    if showQQQLevels and not na(qqqLvlUp1) and qqqLvlUp1 > close and qqqLvlUp1 < best
+        best := qqqLvlUp1
+    if showQQQLevels and not na(qqqLvlUp2) and qqqLvlUp2 > close and qqqLvlUp2 < best
+        best := qqqLvlUp2
+    if not na(hvbZone1) and hvbZone1 > close and hvbZone1 < best
+        best := hvbZone1
+    if not na(hvbZone2) and hvbZone2 > close and hvbZone2 < best
+        best := hvbZone2
+    if not na(povLevel) and povLevel > close and povLevel < best
+        best := povLevel
+    if not na(vahLevel) and vahLevel > close and vahLevel < best
+        best := vahLevel
+    if not na(fvgBullLo) and fvgBullQuality > fvgQualityGate and fvgBullLo > close and fvgBullLo < best
+        best := fvgBullLo
+    if not na(fvgBearHi) and fvgBearQuality > fvgQualityGate and fvgBearHi > close and fvgBearHi < best
+        best := fvgBearHi
+    if not na(obBullMid) and obBullMid > close and obBullMid < best
+        best := obBullMid
+    if not na(obBearMid) and obBearMid > close and obBearMid < best
+        best := obBearMid
+    if trendDown and swingRange > atr * 2 and oteMidShort > close and oteMidShort < best
+        best := oteMidShort
+    best
+f_nearestSupBelow() =>
+    float best = close - atr * tp1Mult
+    if not na(pivotS1) and pivotS1 < close and pivotS1 > best
+        best := pivotS1
+    if not na(pivotS2) and pivotS2 < close and pivotS2 > best
+        best := pivotS2
+    if not na(pivotPP) and pivotPP < close and pivotPP > best
+        best := pivotPP
+    if not na(orbLow) and orbLocked and orbLow < close and orbLow > best
+        best := orbLow
+    if not na(pmLow) and pmLow < close and pmLow > best
+        best := pmLow
+    if not na(pmMid) and pmMid < close and pmMid > best
+        best := pmMid
+    if not na(vwapDn1) and vwapDn1 < close and vwapDn1 > best
+        best := vwapDn1
+    if not na(vwapDn2) and vwapDn2 < close and vwapDn2 > best
+        best := vwapDn2
+    if not na(fpPocMid) and fpPocMid < close and fpPocMid > best
+        best := fpPocMid
+    if showORBMid and not na(orbMid) and orbLocked and orbMid < close and orbMid > best
+        best := orbMid
+    if showONRange and not na(onLow) and onLow < close and onLow > best
+        best := onLow
+    if showQQQLevels and not na(qqqLvlDn1) and qqqLvlDn1 < close and qqqLvlDn1 > best
+        best := qqqLvlDn1
+    if showQQQLevels and not na(qqqLvlDn2) and qqqLvlDn2 < close and qqqLvlDn2 > best
+        best := qqqLvlDn2
+    if not na(hvbZone1) and hvbZone1 < close and hvbZone1 > best
+        best := hvbZone1
+    if not na(hvbZone2) and hvbZone2 < close and hvbZone2 > best
+        best := hvbZone2
+    if not na(povLevel) and povLevel < close and povLevel > best
+        best := povLevel
+    if not na(valLevel) and valLevel < close and valLevel > best
+        best := valLevel
+    if not na(fvgBullHi) and fvgBullQuality > fvgQualityGate and fvgBullHi < close and fvgBullHi > best
+        best := fvgBullHi
+    if not na(fvgBearLo) and fvgBearQuality > fvgQualityGate and fvgBearLo < close and fvgBearLo > best
+        best := fvgBearLo
+    if not na(obBullMid) and obBullMid < close and obBullMid > best
+        best := obBullMid
+    if not na(obBearMid) and obBearMid < close and obBearMid > best
+        best := obBearMid
+    if trendUp and swingRange > atr * 2 and oteMidLong < close and oteMidLong > best
+        best := oteMidLong
+    best
+
+float tpRegimeMult = aerUptrend or aerDowntrend ? 1.2 : aerConsolidation ? 0.8 : 0.6
+float tpRegimeMultSell = aerDowntrend ? 1.2 : aerConsolidation ? 0.7 : 0.6
+float adxTpScale = adx > 30 ? 1.2 : adx > 20 ? 1.0 : 0.85
+float tpVolScale = math.max(0.8, math.min(volRatio, 1.5))
+float tpSessionMult = isNyKZ ? 1.05 : isOpen ? 1.10 : isLunch ? 0.85 : isLast ? 1.03 : inAsia ? 0.90 : 1.0
+float tpMultBuy = tpRegimeMult * adxTpScale * tpVolScale * tpSessionMult
+float tpMultSell = tpRegimeMultSell * adxTpScale * tpVolScale * tpSessionMult
+float tpFloorBuy = f_dynFloorLong()
+float tpFloorSell = f_dynFloorSell()
+
+// Requires TradingView footprint entitlement and data for the selected feed.
+footprint fp = request.footprint(50, 70)
+float fpBuyVol = not na(fp) ? fp.buy_volume() : 0.0
+float fpSellVol = not na(fp) ? fp.sell_volume() : 0.0
+float fpDelta = not na(fp) ? fp.delta() : 0.0
+float fpTotalVol = not na(fp) ? fp.total_volume() : volume
+bool fpHasVolume = not na(fp) and fpBuyVol + fpSellVol > 0
+float fpVAH = na
+float fpVAL = na
+fpPocMid := na
+if fpHasVolume
+    volume_row pocRow = fp.poc()
+    volume_row vahRow = fp.vah()
+    volume_row valRow = fp.val()
+    if not na(pocRow)
+        fpPocMid := (pocRow.up_price() + pocRow.down_price()) / 2.0
+    if not na(vahRow)
+        fpVAH := vahRow.up_price()
+    if not na(valRow)
+        fpVAL := valRow.down_price()
+var float cumFpDelta = 0.0
+if isNewDay
+    cumFpDelta := 0.0
+cumFpDelta += fpDelta
+fpDeltaSlope = cumFpDelta - cumFpDelta[10]
+fpDeltaBull = fpHasVolume and fpDeltaSlope > 0
+fpDeltaBear = fpHasVolume and fpDeltaSlope < 0
+float deltaMag = avgVol > 0 ? math.min(2.0, math.abs(fpDeltaSlope) / (avgVol * 0.1)) : 1.0
+// Missing or all-zero data must never imply extreme imbalance on both sides.
+fpBuyRatio = fpHasVolume ? (fpSellVol > 0 ? fpBuyVol / fpSellVol : 99.0) : 1.0
+fpSellRatio = fpHasVolume ? (fpBuyVol > 0 ? fpSellVol / fpBuyVol : 99.0) : 1.0
+
+f_starAdjTpShort(float rawTp, int stars) =>
+    baseMult = stars >= 5 ? 1.0 : stars >= 4 ? 0.85 : stars >= 3 ? 0.7 : stars >= 2 ? 0.55 : 0.4
+    trendAdj = aerDowntrend ? 0.10 : aerConsolidation ? -0.05 : aerChoppy ? -0.15 : 0.0
+    volAdj = relVol >= f_exitVolClimax() ? 0.08 : relVol >= f_mfiWtHi() ? 0.04 : relVol < f_mfiWtLo() ? -0.08 : 0.0
+    adxAdj = adx >= 30 ? 0.08 : adx >= 20 ? 0.0 : -0.08
+    flowAdj = fpDelta < 0 and fpSellRatio >= f_trapFpRatio() ? 0.05 * deltaMag : fpDeltaBear ? 0.03 * deltaMag : -0.05
+    sessionAdj = isNyKZ ? 0.05 : isOpen ? 0.05 : isLunch ? -0.30 : isLast ? 0.03 : inPreMkt ? -0.20 : inLondon ? -0.20 : inAsia ? -0.25 : isAfternoon ? -0.10 : 0.0
+    dynMult = math.max(0.3, math.min(1.25, baseMult + trendAdj + volAdj + adxAdj + flowAdj + sessionAdj))
+    math.min(close - (close - rawTp) * dynMult, close - tpFloorSell)
+f_starAdjTpLong(float rawTp, int stars) =>
+    baseMult = stars >= 5 ? 1.0 : stars >= 4 ? 0.85 : stars >= 3 ? 0.7 : stars >= 2 ? 0.55 : 0.4
+    trendAdj = aerUptrend ? 0.10 : aerConsolidation ? -0.05 : aerChoppy ? -0.15 : 0.0
+    volAdj = relVol >= f_exitVolClimax() ? 0.08 : relVol >= f_mfiWtHi() ? 0.04 : relVol < f_mfiWtLo() ? -0.08 : 0.0
+    adxAdj = adx >= 30 ? 0.08 : adx >= 20 ? 0.0 : -0.08
+    flowAdj = fpDelta > 0 and fpBuyRatio >= f_trapFpRatio() ? 0.05 * deltaMag : fpDeltaBull ? 0.03 * deltaMag : -0.05
+    sessionAdj = isNyKZ ? 0.05 : isOpen ? 0.05 : isLunch ? -0.30 : isLast ? 0.03 : inPreMkt ? -0.20 : inLondon ? -0.20 : inAsia ? -0.25 : 0.0
+    dynMult = math.max(0.3, math.min(1.25, baseMult + trendAdj + volAdj + adxAdj + flowAdj + sessionAdj))
+    math.max(close + (rawTp - close) * dynMult, close + tpFloorBuy)
+
+// Keep the supplied asymmetric long/short target choices as the benchmark.
+float mainTpLong = math.max(f_nearestResAbove(), close + f_dynFloorLong() * 1.8)
+float mainTpShort = math.max(f_nearestSupBelow(), close - f_dynFloorSell() * 1.5)
+float mainTpLongAdj = math.max(close + (mainTpLong - close) * tpMultBuy - tpBuffer, close + tpFloorBuy)
+float mainTpShortAdj = math.min(close - (close - mainTpShort) * tpMultSell + tpBuffer, close - tpFloorSell)
+float bosTpLong = math.max(f_nearestResAbove(), close + f_dynFloorLong() * 1.2)
+float bosTpShort = math.max(f_nearestSupBelow(), close - f_dynFloorSell() * 1.2)
+float bosTpLongAdj = math.max(close + (bosTpLong - close) * tpMultBuy * 0.7, close + tpFloorBuy)
+float bosTpShortAdj = math.min(close - (close - bosTpShort) * tpMultSell * 0.7, close - tpFloorSell)
+float obTpLong = math.max(f_nearestResAbove(), close + f_dynFloorLong() * 1.5)
+float obTpShort = math.max(f_nearestSupBelow(), close - f_dynFloorSell() * 1.0)
+float obTpLongAdj = math.max(close + (obTpLong - close) * tpMultBuy - tpBuffer, close + tpFloorBuy)
+float obTpShortAdj = math.min(close - (close - obTpShort) * tpMultSell + tpBuffer, close - tpFloorSell)
+
+bosHighVal = ta.highest(high, bosLen)[1]
+bosLowVal = ta.lowest(low, bosLen)[1]
+bosBreakSize = atr * f_bosBreakMult()
+bosBullRaw = useBOS and close > bosHighVal and close - bosHighVal > bosBreakSize and relVol >= f_bosVolThresh() and close > open
+bosBearRaw = useBOS and close < bosLowVal and bosLowVal - close > bosBreakSize and relVol >= f_bosVolThresh() and close < open
+var int lastBosBar = 0
+bullBOS = bosBullRaw and bar_index - lastBosBar > 10
+bearBOS = bosBearRaw and bar_index - lastBosBar > 10
+if bullBOS or bearBOS
+    lastBosBar := bar_index
+bool bosCreatedFVG = low > high[2] or high < low[2]
+bool bosInKZ = f_inSession("0200-0300") or isNyKZ
+int bosBuyConfBase = bullBOS ? (h5f > h5s ? 1 : 0) + (close > vwapVal ? 1 : 0) + (adx > 25 ? 1 : 0) + (aerUptrend ? 1 : 0) + (bosInKZ ? 1 : 0) + (bosCreatedFVG ? 1 : 0) + (close > ema21 ? 1 : 0) + (relVol >= 1.5 ? 1 : 0) + (fpDeltaBull ? 1 : 0) + (fpBuyRatio >= 1.5 ? 1 : 0) + (csBullEngulf ? 1 : 0) + (not csDoji ? 1 : 0) : 0
+int bosSellConfBase = bearBOS ? (h5f < h5s ? 1 : 0) + (close < vwapVal ? 1 : 0) + (adx > 25 ? 1 : 0) + (aerDowntrend ? 1 : 0) + (bosInKZ ? 1 : 0) + (bosCreatedFVG ? 1 : 0) + (close < ema21 ? 1 : 0) + (relVol >= 1.5 ? 1 : 0) + (fpDeltaBear ? 1 : 0) + (fpSellRatio >= 1.5 ? 1 : 0) + (csBearEngulf ? 1 : 0) + (not csDoji ? 1 : 0) : 0
+
+swpHighVal = ta.highest(high, sweepLen)[1]
+swpLowVal = ta.lowest(low, sweepLen)[1]
+swpAvgRange = ta.sma(csRange, 20)
+f_swpWickMinMult() =>
+    base = 0.6
+    sessAdj = isOpen ? 0.15 : isMorning ? -0.045 : isLunch ? 0.1 : isAfternoon ? -0.05 : isLast ? 0.05 : inPreMkt ? 0.15 : inLondon ? 0.12 : inAsia ? 0.15 : 0.0
+    regAdj = aerTrending ? 0.1 : aerChoppy ? -0.1 : 0.0
+    math.max(0.3, math.min(1.0, base + sessAdj + regAdj))
+f_swpWickBodyThresh() =>
+    base = 1.2
+    regAdj = aerTrending ? 0.2 : aerChoppy ? -0.2 : 0.0
+    sessAdj = isOpen ? 0.1 : isMorning ? -0.03 : isLunch ? -0.1 : isAfternoon ? -0.05 : isLast ? 0.03 : 0.0
+    math.max(0.8, math.min(1.8, base + regAdj + sessAdj))
+f_swpVolThresh() =>
+    base = 1.7
+    sessAdj = isOpen ? 0.3 : isMorning ? -0.09 : isLunch ? -0.3 : isAfternoon ? -0.15 : isLast ? 0.1 : inPreMkt ? -0.4 : inLondon ? -0.32 : inAsia ? -0.4 : 0.0
+    adxAdj = adx >= 30 ? 0.2 : adx < 20 ? -0.2 : 0.0
+    math.max(1.0, math.min(2.8, base + sessAdj + adxAdj))
+f_swpRangeThresh() => f_dyn(1.3, 0.15, -0.1, 0.15, 0.1, -0.1, 0.0, 0.0, 0.9, 1.8)
+swpWickMin = atr * f_swpWickMinMult()
+float swpMeanUpper = ta.sma(csUpperWk, 20)
+float swpMeanLower = ta.sma(csLowerWk, 20)
+float swpStdUpper = ta.stdev(csUpperWk, 20)
+float swpStdLower = ta.stdev(csLowerWk, 20)
+float swpStdevFactor = isOpen ? 1.2 : isMorning ? 1.3 : isLunch ? 1.8 : isAfternoon ? 1.5 : inAsia ? 1.8 : aerTrending and adx >= 30 ? 1.1 : aerTrending ? 1.3 : aerChoppy ? 1.7 : adx < 15 ? 1.7 : 1.5
+bool swpStdevOkHigh = csUpperWk > swpMeanUpper + swpStdevFactor * swpStdUpper
+bool swpStdevOkLow = csLowerWk > swpMeanLower + swpStdevFactor * swpStdLower
+swpFakeHigh = high > swpHighVal and close < swpHighVal
+swpFakeLow = low < swpLowVal and close > swpLowVal
+swpWickOk = csUpperWk > swpWickMin or csLowerWk > swpWickMin
+swpWickBody = csBody > 0 ? math.max(csUpperWk, csLowerWk) / csBody >= f_swpWickBodyThresh() : true
+swpVolOk = relVol >= f_swpVolThresh()
+swpRangeOk = csRange > swpAvgRange * f_swpRangeThresh()
+bullSweep = useSweep and swpFakeHigh and swpWickOk and swpWickBody and swpVolOk and swpRangeOk and swpStdevOkHigh
+bearSweep = useSweep and swpFakeLow and swpWickOk and swpWickBody and swpVolOk and swpRangeOk and swpStdevOkLow
+baseL = trendUp and rsiBull and brkL and longBrkClean
+baseS = trendDown and rsiBear and brkS and shortBrkConf
+vizSigL = liquidityOk and longsEnabled and baseL
+vizSigS = liquidityOk and baseS
+bool stratC_Long = inOTELong and swingRange > atr * 2
+bool stratC_Short = inOTEShort and swingRange > atr * 2
+
+// Confirmed swing structure, CHoCH, and legacy ES SMT divergence.
+float pivLow = ta.pivotlow(low, 3, 3)
+float pivHigh = ta.pivothigh(high, 3, 3)
+var float sl0 = na
+var float sl1 = na
+var float sh0 = na
+var float sh1 = na
+if not na(pivLow)
+    sl1 := sl0
+    sl0 := pivLow
+if not na(pivHigh)
+    sh1 := sh0
+    sh0 := pivHigh
+bool hlBullish = not na(sl0) and not na(sl1) and sl0 > sl1
+bool llBearish = not na(sl0) and not na(sl1) and sl0 < sl1
+bool hhBullish = not na(sh0) and not na(sh1) and sh0 > sh1
+bool lhBearish = not na(sh0) and not na(sh1) and sh0 < sh1
+bool fullBullStruct = hhBullish and hlBullish
+bool fullBearStruct = llBearish and lhBearish
+bool chochBull = fullBearStruct and not na(sh0) and close > sh0
+bool chochBear = fullBullStruct and not na(sl0) and close < sl0
+float esPivH = ta.pivothigh(esHigh, 5, 5)
+float esPivL = ta.pivotlow(esLow, 5, 5)
+var float esSwHi1 = na
+var float esSwHi2 = na
+var float esSwLo1 = na
+var float esSwLo2 = na
+if not na(esPivH)
+    esSwHi2 := esSwHi1
+    esSwHi1 := esPivH
+if not na(esPivL)
+    esSwLo2 := esSwLo1
+    esSwLo1 := esPivL
+bool smtBearRaw = hhBullish and not na(esSwHi1) and not na(esSwHi2) and esSwHi1 <= esSwHi2
+bool smtBullRaw = llBearish and not na(esSwLo1) and not na(esSwLo2) and esSwLo1 >= esSwLo2
+f_smtLatch() =>
+    adxAdj = adx >= 35 ? -3 : adx < 15 ? 5 : 0
+    base = isOpen ? 10 : isMorning ? 12 : isLunch ? 20 : isAfternoon ? 16 : inAsia ? 25 : aerTrending ? 12 : 15
+    math.max(5, math.min(35, base + adxAdj))
+var int smtBearBar = 0
+var int smtBullBar = 0
+if smtBearRaw
+    smtBearBar := bar_index
+if smtBullRaw
+    smtBullBar := bar_index
+int smtLatchLen = f_smtLatch()
+bool smtBear = bar_index - smtBearBar <= smtLatchLen and smtBearBar > 0
+bool smtBull = bar_index - smtBullBar <= smtLatchLen and smtBullBar > 0
+int bosBuyConf = bosBuyConfBase + (bullBOS and fullBullStruct ? 1 : 0)
+int bosSellConf = bosSellConfBase + (bearBOS and fullBearStruct ? 1 : 0)
+
+float lowest30 = ta.lowest(low, 30)
+float lowest90 = ta.lowest(low, 90)
+float lowest180 = ta.lowest(low, 180)
+float highest30 = ta.highest(high, 30)
+float highest90 = ta.highest(high, 90)
+float highest180 = ta.highest(high, 180)
+f_rangeLow() => isOpen and adx >= 30 ? lowest30 : isMorning ? lowest90 : aerTrending and adx >= 25 ? lowest90 : isAfternoon ? lowest90 : isLast ? lowest90 : isLunch or aerChoppy or inAsia or inPreMarket ? lowest180 : lowest90
+f_rangeHigh() => isOpen and adx >= 30 ? highest30 : isMorning ? highest90 : aerTrending and adx >= 25 ? highest90 : isAfternoon ? highest90 : isLast ? highest90 : isLunch or aerChoppy or inAsia or inPreMarket ? highest180 : highest90
+float rangeLoNow = f_rangeLow()
+float rangeHiNow = f_rangeHigh()
+float rangeLo = rangeLoNow[1]
+float rangeHi = rangeHiNow[1]
+float rangeSz = rangeHi - rangeLo
+float rangePos = rangeSz > 0 ? (close - rangeLo) / rangeSz : 0.5
+f_rangeLowBlockShort() =>
+    base = 0.20
+    adxAdj = adx >= 30 ? -0.03 : adx < 20 ? 0.04 : 0.0
+    regimeAdj = aerDowntrend ? -0.08 : aerUptrend ? 0.08 : aerChoppy ? 0.05 : 0.0
+    volAdj = volRatio >= 1.5 ? 0.05 : volRatio < 0.8 ? -0.03 : 0.0
+    sessionAdj = inPreMarket or inAsia ? 0.08 : 0.0
+    math.max(0.08, math.min(0.40, base + adxAdj + regimeAdj + volAdj + sessionAdj))
+f_rangeHighBlockShort() =>
+    base = 0.65
+    adxAdj = adx >= 30 ? 0.05 : adx < 20 ? -0.05 : 0.0
+    regimeAdj = aerUptrend ? -0.10 : aerDowntrend ? 0.15 : 0.0
+    flowAdj = fpDeltaBull ? -0.05 * deltaMag : fpDeltaBear ? 0.05 * deltaMag : 0.0
+    math.max(0.55, math.min(0.85, base + adxAdj + regimeAdj + flowAdj))
+f_rangeHighBlockLong() =>
+    base = 0.80
+    adxAdj = adx >= 30 ? 0.03 : adx < 20 ? -0.04 : 0.0
+    regimeAdj = aerUptrend ? 0.08 : aerDowntrend ? -0.08 : aerChoppy ? -0.05 : 0.0
+    volAdj = volRatio >= 1.5 ? -0.05 : volRatio < 0.8 ? 0.03 : 0.0
+    sessionAdj = inPreMarket or inAsia ? -0.08 : 0.0
+    math.max(0.60, math.min(0.92, base + adxAdj + regimeAdj + volAdj + sessionAdj))
+f_rangeLowBlockLong() =>
+    base = 0.35
+    adxAdj = adx >= 30 ? -0.05 : adx < 20 ? 0.05 : 0.0
+    regimeAdj = aerDowntrend ? 0.10 : aerUptrend ? -0.15 : 0.0
+    flowAdj = fpDeltaBear ? 0.05 * deltaMag : fpDeltaBull ? -0.05 * deltaMag : 0.0
+    math.max(0.15, math.min(0.45, base + adxAdj + regimeAdj + flowAdj))
+bool rangeBlocksShort_low = rangePos >= 0.0 and rangePos < f_rangeLowBlockShort()
+bool rangeBlocksShort_high = rangePos <= 1.0 and rangePos > f_rangeHighBlockShort()
+bool rangeBlocksLong_high = rangePos <= 1.0 and rangePos > f_rangeHighBlockLong()
+bool rangeBlocksLong_low = rangePos >= 0.0 and rangePos < f_rangeLowBlockLong()
+f_capitVolMult() => aerChoppy ? 3.0 : aerTrending ? 2.2 : 2.5
+f_capitBodyAtrMult() => aerChoppy ? 1.8 : aerTrending ? 1.3 : 1.5
+f_capitWindowDepth() => adx >= 30 and aerTrending ? 2 : isOpen ? 3 : isMorning ? 3 : isAfternoon ? 4 : aerChoppy or inAsia or inPreMarket or isLunch ? 5 : aerTrending ? 3 : 4
+int capitDepth = f_capitWindowDepth()
+bool capitulationDown = false
+bool capitulationUp = false
+for i = 0 to capitDepth - 1
+    bool capitQuality = relVol[i] >= f_capitVolMult() and math.abs(close[i] - open[i]) >= atr * f_capitBodyAtrMult()
+    capitulationDown := capitulationDown or (close[i] < open[i] and capitQuality)
+    capitulationUp := capitulationUp or (close[i] > open[i] and capitQuality)
+bool wickBlocksShort = csLowerWk >= atr * 0.8 and csLowerWk > csUpperWk
+bool wickBlocksLong = csUpperWk >= atr * 0.8 and csUpperWk > csLowerWk
+f_tfVote(float c, float fEma, float sEma, float mid) =>
+    v1 = c > sEma ? 0.5 : c < sEma ? -0.5 : 0.0
+    v2 = fEma > sEma ? 1.0 : fEma < sEma ? -1.0 : 0.0
+    v3 = c > mid ? 0.5 : c < mid ? -0.5 : 0.0
+    v1 + v2 + v3
+float h5Vote = f_tfVote(h5c, h5f, h5s, h5mid)
+float h15Vote = f_tfVote(h15c, h15f, h15s, h15mid)
+float h60Vote = f_tfVote(h60c, h60f, h60s, h60mid)
+float htfConfScore = h5Vote + h15Vote * 1.5 + h60Vote * 2.0
+float htfDivSessWt = isOpen ? 1.0 : isMorning ? 0.9 : isLunch ? 0.7 : isAfternoon ? 0.8 : isLast ? 0.9 : inPreMkt ? 0.5 : inLondon ? 0.6 : inAsia ? 0.4 : 0.5
+float htfDivRegWt = aerTrending ? 1.1 : aerChoppy ? 0.7 : 0.9
+float htfDivAdxWt = adx >= 35 ? 1.2 : adx >= 25 ? 1.0 : adx < 15 ? 0.6 : 0.8
+float htfDivHurstWt = hurstRevert ? 1.2 : hurstPersist ? 0.8 : 1.0
+float htfDivVolWt = relVol >= 2.0 ? 1.2 : relVol < 0.7 ? 0.7 : 1.0
+float htfDivWt = htfDivSessWt * htfDivRegWt * htfDivAdxWt * htfDivHurstWt * htfDivVolWt
+if h5Vote <= -1.0 and h15Vote >= 1.0 and h60Vote >= 1.0
+    htfConfScore -= 2.0 * htfDivWt
+if h5Vote >= 1.0 and h15Vote <= -1.0 and h60Vote <= -1.0
+    htfConfScore += 2.0 * htfDivWt
+int odChochWt = isOpen ? 2 : isMorning ? 2 : isAfternoon ? 1 : aerTrending and adx >= 30 ? 2 : inAsia ? 0 : 1
+int odStructWt = aerTrending and adx >= 25 ? 2 : 1
+int odDeltaWt = isOpen and adx >= 25 ? 2 : 1
+int odConfLong = odConfLongBase + (smtBull ? odSmtWt : 0) + (chochBull ? odChochWt : 0) + (fullBullStruct ? odStructWt : 0) + (fpDeltaBull ? odDeltaWt : 0)
+int odConfShort = odConfShortBase + (smtBear ? odSmtWt : 0) + (chochBear ? odChochWt : 0) + (fullBearStruct ? odStructWt : 0) + (fpDeltaBear ? odDeltaWt : 0)
+float odHtfVetoThresh = isOpen ? 5.0 : isMorning ? 4.5 : isLunch ? 3.5 : isAfternoon ? 4.0 : inAsia ? 3.0 : aerTrending and adx >= 30 ? 4.5 : aerChoppy ? 3.0 : 4.0
+bool odHtfVetoBuy = htfConfScore <= -odHtfVetoThresh
+bool odHtfVetoSell = htfConfScore >= odHtfVetoThresh
+float odPmRangePos = not na(pmHigh) and not na(pmLow) and pmHigh - pmLow > 0 ? (close - pmLow) / (pmHigh - pmLow) : 0.5
+float odPmBlockSellBelow = aerTrending ? 0.25 : aerChoppy ? 0.35 : adx >= 30 ? 0.22 : adx < 15 ? 0.35 : isOpen ? 0.28 : 0.30
+float odPmBlockBuyAbove = aerTrending ? 0.75 : aerChoppy ? 0.65 : adx >= 30 ? 0.78 : adx < 15 ? 0.65 : isOpen ? 0.72 : 0.70
+bool odPmVetoBuy = odPmRangePos > odPmBlockBuyAbove
+bool odPmVetoSell = odPmRangePos < odPmBlockSellBelow
+float odContraHtfHigh = isOpen ? 3.5 : aerTrending and adx >= 30 ? 2.5 : aerChoppy ? 2.0 : 3.0
+float odContraHtfMid = isOpen ? 2.0 : aerTrending ? 1.0 : 1.5
+int odContraAdj = htfConfScore >= odContraHtfHigh ? 2 : htfConfScore >= odContraHtfMid ? 1 : 0
+int odContraAdjBuy = htfConfScore <= -odContraHtfHigh ? 2 : htfConfScore <= -odContraHtfMid ? 1 : 0
+bool odBuyRaw = (odBuyGateEarly or (odWindow and odVolSpike and odStrongBull and odConfLong >= f_odMinConf() + odContraAdjBuy)) and not odHtfVetoBuy and not odPmVetoBuy
+bool odSellRaw = (odSellGateEarly or (odWindow and odVolSpike and odStrongBear and odConfShort >= f_odMinConf() + odContraAdj)) and not odHtfVetoSell and not odPmVetoSell
+
+f_htfVetoShort() =>
+    base = 3.0
+    sessionAdj = isOpen ? -0.5 : isMorning ? 0.15 : isLunch ? 1.0 : isAfternoon ? 0.5 : isLast ? -0.15 : inPreMkt ? 0.5 : inLondon ? 0.4 : inAsia ? 0.5 : 0.0
+    regimeAdj = aerUptrend ? -1.0 : aerDowntrend ? 1.0 : aerChoppy ? 0.5 : 0.0
+    adxAdj = adx >= 30 ? -0.5 : adx < 20 ? 0.5 : 0.0
+    volAdj = volRatio >= 1.5 ? -0.3 : volRatio < 0.8 ? 0.3 : 0.0
+    flowAdj = fpDeltaBull ? -0.5 : fpDeltaBear ? 0.5 : 0.0
+    hurstAdj = hurstPersist ? -0.3 : hurstRevert ? 0.3 : 0.0
+    math.max(1.0, math.min(6.0, base + sessionAdj + regimeAdj + adxAdj + volAdj + flowAdj + hurstAdj))
+f_htfVetoLong() =>
+    base = -3.0
+    sessionAdj = isOpen ? 0.5 : isMorning ? -0.15 : isLunch ? 0.5 : isAfternoon ? -0.5 : isLast ? 0.15 : inPreMkt ? 0.5 : inLondon ? 0.4 : inAsia ? 0.5 : 0.0
+    regimeAdj = aerDowntrend ? 1.0 : aerUptrend ? -1.0 : aerChoppy ? -0.5 : 0.0
+    adxAdj = adx >= 30 ? 0.5 : adx < 20 ? -0.5 : 0.0
+    volAdj = volRatio >= 1.5 ? 0.3 : volRatio < 0.8 ? -0.3 : 0.0
+    flowAdj = fpDeltaBear ? 0.5 : fpDeltaBull ? -0.5 : 0.0
+    hurstAdj = hurstPersist ? 0.3 : hurstRevert ? -0.3 : 0.0
+    math.max(-6.0, math.min(-1.0, base + sessionAdj + regimeAdj + adxAdj + volAdj + flowAdj + hurstAdj))
+bool htfBlocksShort = htfConfScore >= f_htfVetoShort()
+bool htfBlocksLong = htfConfScore <= f_htfVetoLong()
+int shortAuxBlockerCount = (hlBullish ? 1 : 0) + (hhBullish ? 1 : 0) + (rangeBlocksShort_high ? 1 : 0) + (capitulationDown ? 1 : 0) + (wickBlocksShort ? 1 : 0)
+int longAuxBlockerCount = (llBearish ? 1 : 0) + (lhBearish ? 1 : 0) + (rangeBlocksLong_low ? 1 : 0) + (capitulationUp ? 1 : 0) + (wickBlocksLong ? 1 : 0)
+f_shortAuxBlockThresh() =>
+    base = 2.0
+    macroAdj = htfConfScore >= (isOpen ? 5.0 : 4.0) ? -1.0 : htfConfScore >= (isOpen ? 3.0 : 2.0) ? -0.5 : htfConfScore <= -(isOpen ? 5.0 : 4.0) ? 1.5 : htfConfScore <= -(isOpen ? 3.0 : 2.0) ? 0.8 : 0.0
+    regimeAdj = aerUptrend ? -0.3 : aerDowntrend ? 0.5 : aerChoppy ? 0.2 : 0.0
+    sessAdj = isOpen ? -0.3 : isMorning ? -0.15 : isLunch ? 0.3 : isAfternoon ? 0.1 : isLast ? -0.1 : inPreMkt ? 0.3 : inLondon ? 0.2 : inAsia ? 0.3 : 0.0
+    adxAdj = adx >= 30 ? -0.2 : adx < 20 ? 0.2 : 0.0
+    hurstAdj = hurstPersist ? -0.15 : hurstRevert ? 0.2 : 0.0
+    volAdj = relVol >= 2.0 ? -0.2 : relVol < 0.7 ? 0.2 : 0.0
+    emaAdj = close > ema100 + atr ? -0.3 : close < ema100 - atr ? 0.5 : 0.0
+    flowAdj = fpDeltaBull ? -0.2 : fpDeltaBear ? 0.3 : 0.0
+    math.max(1.0, math.min(4.0, base + macroAdj + regimeAdj + sessAdj + adxAdj + hurstAdj + volAdj + emaAdj + flowAdj))
+f_longAuxBlockThresh() =>
+    base = 2.0
+    macroAdj = htfConfScore <= -(isOpen ? 5.0 : 4.0) ? -1.0 : htfConfScore <= -(isOpen ? 3.0 : 2.0) ? -0.5 : htfConfScore >= (isOpen ? 5.0 : 4.0) ? 1.5 : htfConfScore >= (isOpen ? 3.0 : 2.0) ? 0.8 : 0.0
+    regimeAdj = aerDowntrend ? -0.3 : aerUptrend ? 0.5 : aerChoppy ? 0.2 : 0.0
+    sessAdj = isOpen ? -0.3 : isMorning ? -0.15 : isLunch ? 0.3 : isAfternoon ? 0.1 : isLast ? -0.1 : inPreMkt ? 0.3 : inLondon ? 0.2 : inAsia ? 0.3 : 0.0
+    adxAdj = adx >= 30 ? -0.2 : adx < 20 ? 0.2 : 0.0
+    hurstAdj = hurstPersist ? -0.15 : hurstRevert ? 0.2 : 0.0
+    volAdj = relVol >= 2.0 ? -0.2 : relVol < 0.7 ? 0.2 : 0.0
+    emaAdj = close < ema100 - atr ? -0.3 : close > ema100 + atr ? 0.5 : 0.0
+    flowAdj = fpDeltaBear ? -0.2 : fpDeltaBull ? 0.2 : 0.0
+    math.max(1.0, math.min(4.0, base + macroAdj + regimeAdj + sessAdj + adxAdj + hurstAdj + volAdj + emaAdj + flowAdj))
+bool structBlocksShort = rangeBlocksShort_low or htfBlocksShort or shortAuxBlockerCount >= f_shortAuxBlockThresh()
+bool structBlocksLong = rangeBlocksLong_high or htfBlocksLong or longAuxBlockerCount >= f_longAuxBlockThresh()
+bool bearRetest = aerDowntrend and high > ema21 and close < ema21 and not hlBullish
+bool bullRetest = aerUptrend and low < ema21 and close > ema21 and not llBearish
+bool retestBodyOk = csRange > 0 and csBody / csRange > 0.3
+bullRetestScore = (adx > 25 ? 1 : 0) + (relVol >= f_confVolBounce() ? 1 : 0) + (close > vwapVal ? 1 : 0) + (htfBull ? 1 : 0) + (retestBodyOk ? 1 : 0) + (fpDeltaBull ? 1 : 0)
+bearRetestScore = (adx > 25 ? 1 : 0) + (relVol >= f_confVolBounce() ? 1 : 0) + (close < vwapVal ? 1 : 0) + (htfBear ? 1 : 0) + (retestBodyOk ? 1 : 0) + (fpDeltaBear ? 1 : 0)
+f_retestMinBear() =>
+    base = retestMinRules * 1.0
+    structAdj = hhBullish ? 1.0 : 0.0
+    htfAdj = htfConfScore >= 3.0 ? 1.0 : 0.0
+    emaAdj = close > ema100 ? 1.0 : 0.0
+    math.min(6.0, base + structAdj + htfAdj + emaAdj)
+f_retestMinBull() =>
+    base = retestMinRules * 1.0
+    structAdj = lhBearish ? 1.0 : 0.0
+    htfAdj = htfConfScore <= -3.0 ? 1.0 : 0.0
+    emaAdj = close < ema100 ? 1.0 : 0.0
+    sessAdj = isOpen ? 1.5 : isMorning ? 1.0 : isLast ? 0.5 : inAsia ? 0.5 : inPreMkt ? 1.0 : 0.0
+    math.min(6.0, base + structAdj + htfAdj + emaAdj + sessAdj)
+bool bullRetestOk = bullRetest and bullRetestScore >= f_retestMinBull()
+bool bearRetestOk = bearRetest and bearRetestScore >= f_retestMinBear()
+bool shortHtfSlopeOk = h15s < h15s[5] and h60s < h60s[3]
+bool shortVwapSlopeOk = vwapVal <= vwapVal[5]
+bool shortRolledOver = close < ta.highest(high, 10) - atr
+int structGateCount = (shortHtfSlopeOk ? 1 : 0) + (shortVwapSlopeOk ? 1 : 0) + (shortRolledOver ? 1 : 0)
+
+mfiVal = ta.mfi(hlc3, 14)
+mfiBull = mfiVal > 50 and mfiVal < 80
+mfiBear = mfiVal < 50 and mfiVal > 20
+mfiExhBuy = mfiVal >= f_mfiExhBuyThresh()
+mfiExhSel = mfiVal <= f_mfiExhSelThresh()
+tickSma = request.security("USI:TICK", timeframe.period, ta.sma(close, 10), lookahead=barmerge.lookahead_off)
+tickBull = not na(tickSma) and tickSma > 200
+tickBear = not na(tickSma) and tickSma < -200
+[vixClose, vixPrev] = request.security("CBOE:VIX", timeframe.period, [close, close[10]], lookahead=barmerge.lookahead_off)
+vixRising = not na(vixClose) and not na(vixPrev) and vixClose > vixPrev * f_vixRiseThresh()
+vixFalling = not na(vixClose) and not na(vixPrev) and vixClose < vixPrev * f_vixFallThresh()
+regNow40 = ta.linreg(close, 40, 0)
+regPrev40 = ta.linreg(close, 40, 1)
+lrSlope = regNow40 - regPrev40
+emaSlope = (ema9 - ema9[5]) / 5.0
+vwapBias = close > vwapCalc ? 1.0 : close < vwapCalc ? -1.0 : 0.0
+htfSlope = h5f - h5s
+float tickMag = not na(tickSma) ? math.min(2.0, math.abs(tickSma) / 400.0) : 0.0
+float vixMag = not na(vixClose) ? math.min(1.5, math.max(0.5, vixClose / 20.0)) : 1.0
+float mfiMag = math.min(1.5, math.abs(mfiVal - 50.0) / 30.0)
+float rawFlowDelta = fpBuyVol - fpSellVol
+float rawFlowMag = avgVol > 0 ? math.min(1.5, math.abs(rawFlowDelta) / (avgVol * 0.3)) : 0.0
+
+// Multi-factor direction score; post-entry diagnostic factors are added later.
+float dirScoreFull = 0.0
+dirScoreFull += lrSlope > 0 ? 1.0 : lrSlope < 0 ? -1.0 : 0.0
+dirScoreFull += emaSlope > 0 ? 1.0 : emaSlope < 0 ? -1.0 : 0.0
+dirScoreFull += vwapBias
+dirScoreFull += htfSlope > 0 ? 1.0 : htfSlope < 0 ? -1.0 : 0.0
+dirScoreFull += tickBull ? tickMag : tickBear ? -tickMag : 0.0
+dirScoreFull += vixFalling ? vixMag : vixRising ? -vixMag : 0.0
+dirScoreFull += fpDeltaBull ? 1.5 * deltaMag : fpDeltaBear ? -1.5 * deltaMag : 0.0
+dirScoreFull += mfiBull ? 0.5 * mfiMag : mfiBear ? -0.5 * mfiMag : 0.0
+dirScoreFull += mfiExhBuy ? -1.0 : 0.0
+dirScoreFull += mfiExhSel ? 1.0 : 0.0
+dirScoreFull += rawFlowDelta > 0 and close > open ? 0.5 * rawFlowMag : rawFlowDelta < 0 and close < open ? -0.5 * rawFlowMag : 0.0
+dirScoreFull += aerUptrend ? 1.5 : aerDowntrend ? -1.5 : 0.0
+dirScoreFull += dailyBias
+if hurstPersist
+    dirScoreFull += aerUptrend ? 1.0 : aerDowntrend ? -1.0 : 0.0
+if hurstRevert
+    dirScoreFull += aerUptrend ? -0.5 : aerDowntrend ? 0.5 : 0.0
+dirScoreFull += rsStrong ? 0.5 : rsWeak ? -0.5 : 0.0
+dirScoreFull += macdBull ? 0.5 : macdBear ? -0.5 : 0.0
+dirScoreFull += vrzBias * (isOpen ? 0.7 : isMorning ? 0.6 : isLunch ? 0.3 : isAfternoon ? 0.4 : inAsia ? 0.3 : aerTrending ? 0.6 : adx >= 30 ? 0.6 : 0.5)
+dirScoreFull += close > ema200 ? 0.5 : close < ema200 ? -0.5 : 0.0
+float structWt = isOpen ? 2.0 : isMorning ? 1.8 : isLunch ? 0.8 : isAfternoon ? 1.2 : inAsia ? 0.5 : aerTrending and adx >= 25 ? 1.8 : 1.5
+float structPartialWt = isOpen ? 0.7 : isMorning ? 0.6 : inAsia ? 0.2 : isLunch ? 0.3 : isAfternoon ? 0.4 : aerTrending and adx >= 25 ? 0.6 : 0.5
+dirScoreFull += fullBullStruct ? structWt : fullBearStruct ? -structWt : hlBullish and hhBullish ? structPartialWt : llBearish and lhBearish ? -structPartialWt : 0.0
+float smtWt = isOpen ? 1.5 : isMorning ? 1.3 : inAsia ? 0.4 : isLunch ? 0.7 : isAfternoon ? 0.9 : aerTrending and adx >= 25 ? 1.3 : 1.0
+dirScoreFull += smtBull ? smtWt : smtBear ? -smtWt : 0.0
+float chochWt = isOpen ? 2.0 : isMorning ? 1.8 : isLunch ? 0.8 : isAfternoon ? 1.2 : inAsia ? 0.6 : aerTrending and adx >= 30 ? 2.0 : aerTrending ? 1.8 : adx >= 25 ? 1.5 : 1.2
+dirScoreFull += chochBull ? chochWt : chochBear ? -chochWt : 0.0
+float csWt = isOpen ? 0.7 : isMorning ? 0.6 : isLunch ? 0.3 : isAfternoon ? 0.4 : inAsia ? 0.2 : aerTrending and adx >= 30 ? 0.7 : aerTrending ? 0.6 : aerChoppy ? 0.4 : 0.5
+dirScoreFull += csBullEngulf or csHammer ? csWt : csBearEngulf or csShootSt ? -csWt : 0.0
+float pocWt = isOpen ? 0.6 : isMorning ? 0.5 : isLunch ? 0.3 : isAfternoon ? 0.4 : inAsia ? 0.2 : aerTrending ? 0.5 : 0.4
+pocWt *= nodeStrength >= 15 ? 1.3 : nodeStrength >= 10 ? 1.0 : 0.7
+dirScoreFull += pocBuyPct > 60 ? pocWt : pocBuyPct < 40 ? -pocWt : 0.0
+float pocDelta = pocRawBuy - pocRawSell
+float pocDeltaNorm = nodeStrength >= 10 ? (pocDelta > 0 ? 1.0 : pocDelta < 0 ? -1.0 : 0.0) : 0.0
+float pocRawWt = isOpen ? 0.8 : isMorning ? 0.7 : isLunch ? 0.3 : isAfternoon ? 0.5 : inAsia ? 0.2 : aerTrending ? 0.6 : 0.4
+dirScoreFull += pocDeltaNorm * pocRawWt
+float povWt = isOpen ? 0.4 : isMorning ? 0.35 : isLunch ? 0.2 : isAfternoon ? 0.25 : inAsia ? 0.15 : aerTrending ? 0.35 : 0.25
+dirScoreFull += nearPoV and close > open ? povWt : nearPoV and close < open ? -povWt : 0.0
+float bosWt = isOpen ? 2.5 : isMorning ? 2.0 : isLunch ? 0.8 : isAfternoon ? 1.5 : inAsia ? 0.5 : aerTrending and adx >= 30 ? 2.0 : aerChoppy ? 0.6 : 1.5
+dirScoreFull += bullBOS ? bosWt : bearBOS ? -bosWt : 0.0
+float sqzWt = isOpen ? 1.5 : isMorning ? 1.3 : isLunch ? 0.5 : isAfternoon ? 0.8 : inAsia ? 0.3 : aerTrending ? 1.2 : 0.7
+dirScoreFull += sqzFired and sqzMom > 0 ? sqzWt : sqzFired and sqzMom < 0 ? -sqzWt : 0.0
+float retestWt = isOpen ? 1.5 : isMorning ? 1.2 : isLunch ? 0.5 : isAfternoon ? 0.8 : inAsia ? 0.3 : aerTrending and adx >= 25 ? 1.2 : aerChoppy ? 0.4 : hurstPersist ? 1.0 : 0.7
+dirScoreFull += bullRetestOk ? retestWt : bearRetestOk ? -retestWt : 0.0
+float momFlipWt = isOpen ? 0.8 : isMorning ? 0.7 : isLunch ? 0.3 : isAfternoon ? 0.5 : inAsia ? 0.2 : aerTrending ? 0.6 : aerChoppy ? 0.2 : 0.4
+dirScoreFull += momRecentBull ? momFlipWt : momRecentBear ? -momFlipWt : 0.0
+float regFlipWt = isOpen ? 1.5 : isMorning ? 1.2 : isLunch ? 0.5 : isAfternoon ? 0.8 : inAsia ? 0.3 : adx >= 30 ? 1.3 : adx < 20 ? 0.4 : hurstPersist ? 1.0 : 0.7
+dirScoreFull += aerUptrend and not aerUptrend[1] ? regFlipWt : aerDowntrend and not aerDowntrend[1] ? -regFlipWt : 0.0
+float orbWt = orbLocked ? (isMorning ? 1.5 : isOpen ? 1.2 : isAfternoon ? 0.5 : inAsia ? 0.2 : adx >= 30 ? 1.3 : aerChoppy ? 0.3 : hurstPersist ? 1.0 : 0.5) : 0.0
+dirScoreFull += useORB ? (orbBrokenUp ? orbWt : orbBrokenDown ? -orbWt : 0.0) : 0.0
+float orbConfWt = orbLocked ? (isMorning ? 2.0 : isOpen ? 1.5 : isAfternoon ? 0.5 : adx >= 30 ? 1.5 : aerChoppy ? 0.3 : hurstPersist ? 1.2 : 0.5) : 0.0
+dirScoreFull += useORB ? (orbConfirmLong ? orbConfWt : orbConfirmShort ? -orbConfWt : 0.0) : 0.0
+float absWt = isOpen ? 1.5 : isMorning ? 1.2 : isLunch ? 0.5 : isAfternoon ? 0.8 : inAsia ? 0.3 : aerTrending and adx >= 30 ? 1.2 : aerChoppy ? 0.4 : hurstRevert ? 1.0 : hurstPersist ? 0.6 : 0.7
+float regDivWt = isOpen ? 1.0 : isMorning ? 0.8 : isLunch ? 0.5 : isAfternoon ? 0.6 : inAsia ? 0.3 : aerTrending and adx >= 30 ? 0.9 : aerChoppy ? 0.3 : hurstRevert ? 0.8 : hurstPersist ? 0.4 : 0.5
+
+f_dirScoreVetoShort() =>
+    base = 2.0
+    sessionAdj = isOpen ? -0.3 : isMorning ? 0.09 : isLunch ? 0.5 : isAfternoon ? 0.25 : isLast ? -0.09 : inPreMkt ? 0.3 : inLondon ? 0.24 : inAsia ? 0.3 : 0.0
+    regimeAdj = aerUptrend ? -0.5 : aerDowntrend ? 0.8 : aerChoppy ? 0.3 : 0.0
+    adxAdj = adx >= 30 ? -0.3 : adx < 20 ? 0.3 : 0.0
+    volAdj = volRatio >= 1.5 ? -0.2 : volRatio < 0.8 ? 0.2 : 0.0
+    flowAdj = fpDeltaBull ? -0.3 : fpDeltaBear ? 0.3 : 0.0
+    hurstAdj = hurstPersist ? -0.2 : hurstRevert ? 0.2 : 0.0
+    math.max(1.0, math.min(4.0, base + sessionAdj + regimeAdj + adxAdj + volAdj + flowAdj + hurstAdj))
+f_dirScoreVetoLong() =>
+    base = -2.0
+    sessionAdj = isOpen ? 0.3 : isMorning ? -0.09 : isLunch ? 0.3 : isAfternoon ? -0.25 : isLast ? 0.09 : inPreMkt ? 0.3 : inLondon ? 0.25 : inAsia ? 0.3 : 0.0
+    regimeAdj = aerDowntrend ? 0.5 : aerUptrend ? -0.8 : aerChoppy ? -0.3 : 0.0
+    adxAdj = adx >= 30 ? 0.3 : adx < 20 ? -0.3 : 0.0
+    volAdj = volRatio >= 1.5 ? 0.2 : volRatio < 0.8 ? -0.2 : 0.0
+    flowAdj = fpDeltaBear ? 0.3 : fpDeltaBull ? -0.3 : 0.0
+    hurstAdj = hurstPersist ? 0.2 : hurstRevert ? -0.2 : 0.0
+    math.max(-4.0, math.min(-1.0, base + sessionAdj + regimeAdj + adxAdj + volAdj + flowAdj + hurstAdj))
+bool dirBlocksShortFull = dirScoreFull >= f_dirScoreVetoShort()
+bool dirBlocksLongFull = dirScoreFull <= f_dirScoreVetoLong()
+float earlyDirScore = 0.0
+earlyDirScore += h5s > h5s[5] ? 1.0 : h5s < h5s[5] ? -1.0 : 0.0
+earlyDirScore += h15s > h15s[5] ? 1.0 : h15s < h15s[5] ? -1.0 : 0.0
+earlyDirScore += h60s > h60s[3] ? 1.0 : h60s < h60s[3] ? -1.0 : 0.0
+earlyDirScore += ema9 > ema21 ? 1.0 : ema9 < ema21 ? -1.0 : 0.0
+earlyDirScore += close > vwapVal ? 1.0 : close < vwapVal ? -1.0 : 0.0
+earlyDirScore += aerUptrend ? 1.5 : aerDowntrend ? -1.5 : 0.0
+f_dirVetoThreshSell() =>
+    base = 4.0
+    sessionAdj = isOpen ? -0.5 : isMorning ? 0.15 : isLunch ? 0.5 : isAfternoon ? 0.25 : isLast ? -0.15 : inPreMkt ? 0.3 : inLondon ? 0.24 : inAsia ? 0.3 : 0.0
+    regimeAdj = aerUptrend ? -0.5 : aerDowntrend ? 0.5 : aerConsolidation ? 0.3 : aerChoppy ? 0.5 : 0.0
+    adxAdj = adx >= 30 ? -0.3 : adx < 20 ? 0.3 : 0.0
+    volAdj = volRatio >= 1.5 ? -0.3 : volRatio < 0.8 ? 0.3 : 0.0
+    flowAdj = fpDeltaBull ? -0.3 : fpDeltaBear ? 0.3 : 0.0
+    hurstAdj = hurstPersist ? -0.2 : hurstRevert ? 0.2 : 0.0
+    math.max(2.5, math.min(6.0, base + sessionAdj + regimeAdj + adxAdj + volAdj + flowAdj + hurstAdj))
+f_dirTightenThreshSell() =>
+    base = 2.0
+    sessionAdj = isOpen ? -0.3 : isMorning ? 0.09 : isLunch ? 0.3 : isAfternoon ? 0.15 : isLast ? -0.09 : inPreMkt ? 0.2 : inLondon ? 0.16 : inAsia ? 0.2 : 0.0
+    regimeAdj = aerUptrend ? -0.3 : aerChoppy ? 0.3 : 0.0
+    adxAdj = adx >= 30 ? -0.2 : adx < 20 ? 0.2 : 0.0
+    volAdj = volRatio >= 1.5 ? -0.15 : volRatio < 0.8 ? 0.15 : 0.0
+    flowAdj = fpDeltaBull ? -0.2 : fpDeltaBear ? 0.2 : 0.0
+    hurstAdj = hurstPersist ? -0.15 : hurstRevert ? 0.15 : 0.0
+    math.max(1.0, math.min(3.5, base + sessionAdj + regimeAdj + adxAdj + volAdj + flowAdj + hurstAdj))
+f_dirVetoThreshBuy() =>
+    base = 4.0
+    sessionAdj = isOpen ? -0.5 : isMorning ? 0.15 : isLunch ? 0.5 : isAfternoon ? 0.25 : isLast ? -0.15 : inPreMkt ? 0.3 : inLondon ? 0.24 : inAsia ? 0.3 : 0.0
+    regimeAdj = aerDowntrend ? -0.5 : aerUptrend ? 0.5 : aerConsolidation ? 0.3 : aerChoppy ? 0.5 : 0.0
+    adxAdj = adx >= 30 ? -0.3 : adx < 20 ? 0.3 : 0.0
+    volAdj = volRatio >= 1.5 ? -0.3 : volRatio < 0.8 ? 0.3 : 0.0
+    flowAdj = fpDeltaBear ? -0.3 : fpDeltaBull ? 0.3 : 0.0
+    hurstAdj = hurstPersist ? -0.2 : hurstRevert ? 0.2 : 0.0
+    math.max(2.5, math.min(6.0, base + sessionAdj + regimeAdj + adxAdj + volAdj + flowAdj + hurstAdj))
+bool dirBlocksShortHard = earlyDirScore >= f_dirVetoThreshSell()
+bool dirTightensShort = earlyDirScore >= f_dirTightenThreshSell() and not dirBlocksShortHard
+int structReqShort = dirTightensShort ? 2 : 1
+bool shortStructOk = not dirBlocksShortHard and structGateCount >= structReqShort
+bool dirBlocksLong = earlyDirScore <= -f_dirVetoThreshBuy()
+
+f_trendAlignBuf() =>
+    base = 0.3
+    sessionAdj = isOpen ? 0.2 : isMorning ? -0.06 : isLunch ? 0.1 : isAfternoon ? -0.05 : isLast ? 0.06 : inPreMkt ? 0.05 : inLondon ? 0.04 : inAsia ? 0.05 : 0.0
+    volAdj = volRatio >= 1.5 ? 0.15 : volRatio < 0.8 ? -0.10 : 0.0
+    regimeAdj = aerChoppy ? 0.15 : aerConsolidation ? -0.05 : 0.0
+    adxAdj = adx >= 30 ? 0.1 : adx < 20 ? -0.1 : 0.0
+    hurstAdj = hurstPersist ? 0.05 : hurstRevert ? -0.05 : 0.0
+    atr * math.max(0.1, math.min(0.8, base + sessionAdj + volAdj + regimeAdj + adxAdj + hurstAdj))
+int trendSlopeLookback = adx >= 30 ? 3 : adx >= 20 ? 5 : 7
+trendSlopeLookback += isOpen ? -1 : isMorning ? -1 : isLunch ? 1 : isAfternoon ? 0 : isLast ? 0 : inPreMkt ? 1 : inLondon ? 1 : inAsia ? 1 : 0
+trendSlopeLookback += aerTrending ? -1 : aerChoppy ? 1 : 0
+trendSlopeLookback += hurstPersist ? -1 : hurstRevert ? 1 : 0
+trendSlopeLookback := math.max(2, math.min(10, trendSlopeLookback))
+bool shortTrendAlignOk = close < ema100 - f_trendAlignBuf() and ema100 < ema100[trendSlopeLookback]
+bool longTrendAlignOk = close > ema100 + f_trendAlignBuf() and ema100 > ema100[trendSlopeLookback]
+shortVolumeScore = (relVol >= f_mfiWtHi() ? 1 : 0) + (fpDelta < 0 and fpSellRatio >= f_trapFpRatio() ? 1 : 0) + (fpDeltaBear ? 1 : 0) + (ema21 < ema21[5] ? 1 : 0) + (vwapVal - close > atr * 0.5 ? 1 : 0) + (aerDowntrend ? 1 : 0) + (close - f_nearestSupBelow() > atr ? 1 : 0) + (close < open and open - close > atr * 0.3 ? 1 : 0)
+bool shortVolumeOk = shortStructOk and shortVolumeScore >= shortMinRules
+float ema21DistAtr = (close - ema21) / atr
+float vwapDistAtr = (close - vwapVal) / atr
+f_longOverextended() =>
+    sessDistAdj = isOpen ? 0.5 : isMorning ? 0.3 : isLunch ? -0.3 : isAfternoon ? 0.0 : inAsia ? -0.4 : isLast ? 0.2 : 0.0
+    emaDynThresh = (aerUptrend and adx >= 30 ? 2.5 : aerTrending ? 2.0 : aerChoppy ? 1.0 : 1.5) + sessDistAdj
+    vwapDynThresh = (adx >= 35 ? 2.5 : adx >= 25 ? 1.8 : 1.2) + sessDistAdj
+    score = 0.0
+    score += ema21DistAtr >= emaDynThresh * 1.5 ? 2.0 : ema21DistAtr >= emaDynThresh ? 1.0 : 0.0
+    score += vwapDistAtr >= vwapDynThresh * 1.3 ? 1.5 : vwapDistAtr >= vwapDynThresh ? 0.75 : 0.0
+    lhWt = htfConfScore >= (isOpen ? 7.0 : aerTrending ? 6.5 : 6.0) ? 0.5 : htfConfScore >= (isOpen ? 4.0 : aerTrending ? 3.5 : 3.0) ? 1.0 : 1.5
+    score += lhBearish ? lhWt : 0.0
+    mfiWt = relVol >= f_mfiWtHi() ? 1.5 : relVol >= f_mfiWtLo() ? 1.0 : 0.5
+    score += mfiExhBuy ? mfiWt * mfiMag : 0.0
+    volWt = htfConfScore >= (isOpen ? 4.0 : aerTrending ? 3.5 : 3.0) ? 1.0 : 0.5
+    score += relVol < (isOpen ? 0.6 : isMorning ? 0.65 : isLunch ? 0.9 : isAfternoon ? 0.8 : inAsia ? 0.9 : aerTrending ? 0.7 : 0.8) ? volWt : 0.0
+    score += wickBlocksShort ? 0.5 : 0.0
+    sessThreshAdj = isOpen ? 0.75 : isMorning ? 0.4 : isLunch ? -0.5 : isAfternoon ? -0.1 : inAsia ? -0.5 : isLast ? 0.3 : 0.0
+    thresh = 3.0
+    thresh += htfConfScore >= (isOpen ? 7.0 : aerTrending ? 6.5 : 6.0) ? 1.5 : htfConfScore >= (isOpen ? 4.0 : aerTrending ? 3.5 : 3.0) ? 0.75 : 0.0
+    thresh += aerUptrend ? 0.5 : aerChoppy ? -0.5 : 0.0
+    thresh += adx >= 35 ? 0.5 : adx < 20 ? -0.5 : 0.0
+    thresh += fpDeltaBull ? 0.3 * deltaMag : fpDeltaBear ? -0.3 * deltaMag : 0.0
+    thresh += hurstPersist ? 0.3 : hurstRevert ? -0.3 : 0.0
+    thresh += nodeStrength >= 15 ? -0.3 : nodeStrength >= 10 ? -0.15 : nodeStrength < 5 ? 0.2 : 0.0
+    thresh += sessThreshAdj
+    score >= math.max(2.0, math.min(6.5, thresh))
+f_shortOverextended() =>
+    sessDistAdj = isOpen ? 0.5 : isMorning ? 0.3 : isLunch ? -0.3 : isAfternoon ? 0.0 : inAsia ? -0.4 : isLast ? 0.2 : 0.0
+    emaDynThresh = (aerDowntrend and adx >= 30 ? 2.5 : aerTrending ? 2.0 : aerChoppy ? 1.0 : 1.5) + sessDistAdj
+    vwapDynThresh = (adx >= 35 ? 2.5 : adx >= 25 ? 1.8 : 1.2) + sessDistAdj
+    score = 0.0
+    score += -ema21DistAtr >= emaDynThresh * 1.5 ? 2.0 : -ema21DistAtr >= emaDynThresh ? 1.0 : 0.0
+    score += -vwapDistAtr >= vwapDynThresh * 1.3 ? 1.5 : -vwapDistAtr >= vwapDynThresh ? 0.75 : 0.0
+    hhWt = htfConfScore <= -(isOpen ? 7.0 : aerTrending ? 6.5 : 6.0) ? 0.5 : htfConfScore <= -(isOpen ? 4.0 : aerTrending ? 3.5 : 3.0) ? 1.0 : 1.5
+    score += hhBullish ? hhWt : 0.0
+    mfiWt = relVol >= f_mfiWtHi() ? 1.5 : relVol >= f_mfiWtLo() ? 1.0 : 0.5
+    score += mfiExhSel ? mfiWt * mfiMag : 0.0
+    volWt = htfConfScore <= -(isOpen ? 4.0 : aerTrending ? 3.5 : 3.0) ? 1.0 : 0.5
+    score += relVol < (isOpen ? 0.6 : isMorning ? 0.65 : isLunch ? 0.9 : isAfternoon ? 0.8 : inAsia ? 0.9 : aerTrending ? 0.7 : 0.8) ? volWt : 0.0
+    score += wickBlocksLong ? 0.5 : 0.0
+    sessThreshAdj = isOpen ? 0.75 : isMorning ? 0.4 : isLunch ? -0.5 : isAfternoon ? -0.1 : inAsia ? -0.5 : isLast ? 0.3 : 0.0
+    thresh = 3.0
+    thresh += htfConfScore <= -(isOpen ? 7.0 : aerTrending ? 6.5 : 6.0) ? 1.5 : htfConfScore <= -(isOpen ? 4.0 : aerTrending ? 3.5 : 3.0) ? 0.75 : 0.0
+    thresh += aerDowntrend ? 0.5 : aerChoppy ? -0.5 : 0.0
+    thresh += adx >= 35 ? 0.5 : adx < 20 ? -0.5 : 0.0
+    thresh += fpDeltaBear ? 0.3 * deltaMag : fpDeltaBull ? -0.3 * deltaMag : 0.0
+    thresh += hurstPersist ? 0.3 : hurstRevert ? -0.3 : 0.0
+    thresh += nodeStrength >= 15 ? -0.3 : nodeStrength >= 10 ? -0.15 : nodeStrength < 5 ? 0.2 : 0.0
+    thresh += sessThreshAdj
+    score >= math.max(2.0, math.min(6.5, thresh))
+bool longOverextended = f_longOverextended()
+bool shortOverextended = f_shortOverextended()
+bool sessionAllowed = ethEnabled or inRTH
+sigL = sessionAllowed and vizSigL and (stratA_Long or stratB_Long or stratC_Long) and not dirBlocksLong and not dirBlocksLongFull and not structBlocksLong and longTrendAlignOk and not longOverextended
+sigS = sessionAllowed and vizSigS and (stratA_Short or stratB_Short or stratC_Short) and shortVolumeOk and not dirBlocksShortFull and not structBlocksShort and shortTrendAlignOk and not shortOverextended
+
+f_srProxDist() =>
+    base = 0.5
+    sessAdj = isOpen ? 0.2 : isMorning ? -0.06 : isLunch ? -0.1 : isAfternoon ? -0.05 : isLast ? 0.06 : inPreMkt ? -0.15 : inLondon ? -0.12 : inAsia ? -0.15 : 0.0
+    regimeAdj = aerTrending ? 0.15 : aerChoppy ? -0.1 : 0.0
+    adxAdj = adx >= 30 ? 0.1 : adx < 20 ? -0.1 : 0.0
+    math.max(0.2, math.min(0.9, base + sessAdj + regimeAdj + adxAdj)) * atr
+f_nearKeySupport() =>
+    proxDist = f_srProxDist()
+    nearPM = not na(pmLow) and math.abs(close - pmLow) < proxDist
+    nearPMM = not na(pmMid) and math.abs(close - pmMid) < proxDist
+    nearOR = orbLocked and not na(orbLow) and math.abs(close - orbLow) < proxDist
+    nearORM = orbLocked and not na(orbMid) and math.abs(close - orbMid) < proxDist
+    nearVW = math.abs(close - vwapVal) < proxDist and close > vwapVal
+    nearPP = not na(pivotPP) and math.abs(close - pivotPP) < proxDist and close > pivotPP
+    nearS1 = not na(pivotS1) and math.abs(close - pivotS1) < proxDist
+    wickBounce = csLowerWk > csBody * 0.5
+    flowBounce = close > open and fpDeltaBull
+    volBounce = close > open and relVol >= f_confVolBounce()
+    (nearPM or nearPMM or nearOR or nearORM or nearVW or nearPP or nearS1) and (wickBounce or flowBounce or volBounce)
+f_nearKeyResistance() =>
+    proxDist = f_srProxDist()
+    nearPM = not na(pmHigh) and math.abs(close - pmHigh) < proxDist
+    nearPMM = not na(pmMid) and math.abs(close - pmMid) < proxDist
+    nearOR = orbLocked and not na(orbHigh) and math.abs(close - orbHigh) < proxDist
+    nearORM = orbLocked and not na(orbMid) and math.abs(close - orbMid) < proxDist
+    nearVW = math.abs(close - vwapVal) < proxDist and close < vwapVal
+    nearPP = not na(pivotPP) and math.abs(close - pivotPP) < proxDist and close < pivotPP
+    nearR1 = not na(pivotR1) and math.abs(close - pivotR1) < proxDist
+    wickReject = csUpperWk > csBody * 0.5
+    flowReject = close < open and fpDeltaBear
+    volReject = close < open and relVol >= f_confVolBounce()
+    (nearPM or nearPMM or nearOR or nearORM or nearVW or nearPP or nearR1) and (wickReject or flowReject or volReject)
+f_hotZone() =>
+    momNorm = math.abs(sqzMom) / atr
+    momThresh = aerTrending ? 0.25 : aerChoppy ? 0.45 : 0.35
+    sessAdj = isOpen ? -0.08 : isMorning ? 0.024 : isLunch ? 0.1 : isAfternoon ? 0.05 : isLast ? -0.024 : inPreMkt ? 0.1 : inLondon ? 0.08 : inAsia ? 0.1 : 0.0
+    momNorm >= math.max(0.1, momThresh + sessAdj) and atr >= aerMeanATR * 0.85
+bool inHotZone = f_hotZone()
+f_longConfidence() =>
+    htf = htfConfScore >= (isOpen ? 5.0 : aerTrending ? 4.5 : 4.0) ? 1 : 0
+    dir = dirScoreFull >= 3.0 ? 1 : 0
+    struc = hlBullish and hhBullish ? 1 : 0
+    flow = fpDeltaBull ? 1 : 0
+    mean = math.abs(ema21DistAtr) <= 1.5 ? 1 : 0
+    sqzHit = (sqzFired and sqzMom > 0) or (sqzOn and sqzMom > 0 and sqzMom > sqzMom[1])
+    zoneHit = inHotZone and sqzMom > 0 and sqzMom > sqzMom[1]
+    mom = sqzHit or momRecentBull or zoneHit ? 1 : 0
+    bandThresh = aerUptrend ? 0.25 : aerChoppy ? 0.45 : 0.35
+    band = bbPos <= bandThresh ? 1 : 0
+    sr = f_nearKeySupport() ? 1 : 0
+    htf + dir + struc + flow + mean + mom + band + sr
+f_shortConfidence() =>
+    htf = htfConfScore <= -(isOpen ? 5.0 : aerTrending ? 4.5 : 4.0) ? 1 : 0
+    dir = dirScoreFull <= -3.0 ? 1 : 0
+    struc = llBearish and lhBearish ? 1 : 0
+    flow = fpDeltaBear ? 1 : 0
+    mean = math.abs(ema21DistAtr) <= 1.5 ? 1 : 0
+    sqzHit = (sqzFired and sqzMom < 0) or (sqzOn and sqzMom < 0 and sqzMom < sqzMom[1])
+    zoneHit = inHotZone and sqzMom < 0 and sqzMom < sqzMom[1]
+    mom = sqzHit or momRecentBear or zoneHit ? 1 : 0
+    bandThresh = aerDowntrend ? 0.75 : aerChoppy ? 0.55 : 0.65
+    band = bbPos >= bandThresh ? 1 : 0
+    sr = f_nearKeyResistance() ? 1 : 0
+    htf + dir + struc + flow + mean + mom + band + sr
+int confLong = f_longConfidence()
+int confShort = f_shortConfidence()
+f_macroVetoLong() =>
+    if not (llBearish and lhBearish)
+        false
+    else
+        override = 0.0
+        override += htfConfScore >= (isOpen ? 7.0 : aerTrending ? 6.5 : 6.0) ? 1.0 : htfConfScore >= (isOpen ? 4.0 : aerTrending ? 3.5 : 3.0) ? 0.5 : 0.0
+        override += fpDeltaBull ? 0.5 : 0.0
+        override += dirScoreFull >= 4.0 ? 0.5 : 0.0
+        override += isOpen ? 0.3 : isMorning ? 0.25 : isLunch ? 0.0 : isAfternoon ? 0.1 : isLast ? 0.15 : inPreMkt ? 0.0 : inLondon ? 0.05 : 0.0
+        override += adx >= 30 ? 0.2 : 0.0
+        override += relVol >= f_exitVolClimax() ? 0.2 : 0.0
+        override += hurstPersist ? 0.2 : 0.0
+        sessThresh = isOpen ? -0.3 : isMorning ? -0.2 : isLunch ? 0.3 : isAfternoon ? 0.1 : isLast ? -0.1 : inPreMkt ? 0.3 : inLondon ? 0.2 : inAsia ? 0.3 : 0.0
+        adxThresh = adx >= 35 ? -0.2 : adx < 15 ? 0.2 : 0.0
+        hurstThresh = hurstRevert ? 0.3 : hurstPersist ? -0.2 : 0.0
+        volThresh = relVol >= 2.0 ? -0.15 : relVol < 0.7 ? 0.15 : 0.0
+        thresh = (aerDowntrend ? 2.5 : aerChoppy ? 2.0 : 1.5) + sessThresh + adxThresh + hurstThresh + volThresh
+        override < math.max(1.0, math.min(3.5, thresh))
+f_macroVetoShort() =>
+    if not (hlBullish and hhBullish)
+        false
+    else
+        override = 0.0
+        override += htfConfScore <= -(isOpen ? 7.0 : aerTrending ? 6.5 : 6.0) ? 1.0 : htfConfScore <= -(isOpen ? 4.0 : aerTrending ? 3.5 : 3.0) ? 0.5 : 0.0
+        override += fpDeltaBear ? 0.5 : 0.0
+        override += dirScoreFull <= -4.0 ? 0.5 : 0.0
+        override += isOpen ? 0.3 : isMorning ? 0.25 : isLunch ? 0.0 : isAfternoon ? 0.1 : isLast ? 0.15 : inPreMkt ? 0.0 : inLondon ? 0.05 : 0.0
+        override += adx >= 30 ? 0.2 : 0.0
+        override += relVol >= f_exitVolClimax() ? 0.2 : 0.0
+        override += hurstPersist ? 0.2 : 0.0
+        sessThresh = isOpen ? -0.3 : isMorning ? -0.2 : isLunch ? 0.3 : isAfternoon ? 0.1 : isLast ? -0.1 : inPreMkt ? 0.3 : inLondon ? 0.2 : inAsia ? 0.3 : 0.0
+        adxThresh = adx >= 35 ? -0.2 : adx < 15 ? 0.2 : 0.0
+        hurstThresh = hurstRevert ? 0.3 : hurstPersist ? -0.2 : 0.0
+        volThresh = relVol >= 2.0 ? -0.15 : relVol < 0.7 ? 0.15 : 0.0
+        thresh = (aerUptrend ? 2.5 : aerChoppy ? 2.0 : 1.5) + sessThresh + adxThresh + hurstThresh + volThresh
+        override < math.max(1.0, math.min(3.5, thresh))
+bool macroVetoLong = f_macroVetoLong()
+bool macroVetoShort = f_macroVetoShort()
+int ssConfBoostLong = isLast ? 3 : isLunch ? 2 : inLondon ? 2 : inAsia ? 1 : 0
+int ssConfBoostShort = isLast ? 3 : isLunch ? 2 : inLondon ? 2 : inAsia ? 1 : 0
+int ssRegimeBoost = aerChoppy and adx < 20 ? 2 : aerChoppy ? 1 : 0
+int ssExtraConfLong = ssConfBoostLong + ssRegimeBoost
+int ssExtraConfShort = ssConfBoostShort + ssRegimeBoost
+f_bosTpMult() =>
+    base = 1.1
+    sessAdj = inAsia ? -0.1 : inLondon ? -0.1 : inPreMkt ? -0.15 : isOpen ? 0.15 : isMorning ? 0.1 : isLunch ? -0.15 : isAfternoon ? 0.05 : isLast ? -0.05 : 0.0
+    regAdj = aerUptrend ? 0.05 : aerChoppy ? -0.1 : 0.0
+    math.max(0.9, math.min(1.3, base + sessAdj + regAdj))
+f_reTpMult() =>
+    base = 1.05
+    sessAdj = inAsia ? -0.15 : inLondon ? -0.15 : inPreMkt ? -0.1 : isOpen ? -0.1 : isMorning ? -0.05 : isLunch ? -0.15 : isAfternoon ? 0.15 : isLast ? 0.1 : 0.0
+    regAdj = aerUptrend ? 0.05 : aerChoppy ? -0.1 : 0.0
+    hurstAdj = hurstPersist ? 0.05 : hurstRevert ? -0.05 : 0.0
+    math.max(0.8, math.min(1.25, base + sessAdj + regAdj + hurstAdj))
+f_obTpMult() =>
+    base = 1.0
+    sessAdj = inAsia ? -0.2 : inLondon ? -0.15 : inPreMkt ? 0.0 : isOpen ? 0.15 : isMorning ? -0.05 : isLunch ? -0.1 : isAfternoon ? 0.15 : isLast ? -0.2 : 0.0
+    regAdj = aerUptrend ? 0.05 : aerChoppy ? -0.05 : 0.0
+    math.max(0.8, math.min(1.2, base + sessAdj + regAdj))
+f_trapTpMult() =>
+    base = 0.85
+    sessAdj = inAsia ? -0.1 : inLondon ? -0.2 : inPreMkt ? -0.05 : isOpen ? -0.1 : isMorning ? 0.05 : isLunch ? 0.0 : isAfternoon ? -0.05 : isLast ? -0.1 : 0.0
+    regAdj = aerTrending ? 0.05 : aerChoppy ? -0.05 : 0.0
+    math.max(0.6, math.min(1.0, base + sessAdj + regAdj))
+f_bosGateReqLong() =>
+    base = 1.0
+    confAdj = bosBuyConf >= 6 ? -0.5 : 0.0
+    sessAdj = isOpen ? -0.3 : isMorning ? -0.15 : isLunch ? 0.3 : isAfternoon ? 0.15 : isLast ? -0.1 : inPreMkt ? 0.5 : inLondon ? 0.15 : inAsia ? 0.2 : 0.0
+    htfAdj = htfConfScore >= (isOpen ? 5.0 : 4.0) ? -0.3 : htfConfScore <= -(isOpen ? 3.0 : 2.0) ? 0.3 : 0.0
+    regAdj = aerUptrend ? -0.15 : aerDowntrend ? 0.2 : aerChoppy ? 0.15 : 0.0
+    adxAdj = adx >= 30 ? -0.2 : adx < 20 ? 0.2 : 0.0
+    hurstAdj = hurstPersist ? -0.1 : hurstRevert ? 0.15 : 0.0
+    volAdj = relVol >= f_exitVolClimax() ? -0.2 : relVol < f_mfiWtLo() ? 0.2 : 0.0
+    sessFloor = isOpen ? 0.0 : isMorning ? 0.0 : isLunch ? 1.0 : isAfternoon ? 0.0 : isLast ? 0.0 : inPreMkt ? 1.0 : inLondon ? 0.5 : inAsia ? 0.5 : 0.0
+    math.max(sessFloor, math.min(2.0, base + confAdj + sessAdj + htfAdj + regAdj + adxAdj + hurstAdj + volAdj))
+f_bosGateReqShort() =>
+    base = 1.0
+    confAdj = bosSellConf >= 6 ? -0.5 : 0.0
+    sessAdj = isOpen ? -0.3 : isMorning ? -0.15 : isLunch ? 0.3 : isAfternoon ? 0.15 : isLast ? -0.1 : inPreMkt ? 0.5 : inLondon ? 0.4 : inAsia ? 0.5 : 0.0
+    htfAdj = htfConfScore <= -(isOpen ? 5.0 : 4.0) ? -0.3 : htfConfScore >= (isOpen ? 3.0 : 2.0) ? 0.3 : 0.0
+    regAdj = aerDowntrend ? -0.15 : aerUptrend ? 0.2 : aerChoppy ? 0.15 : 0.0
+    adxAdj = adx >= 30 ? -0.2 : adx < 20 ? 0.2 : 0.0
+    hurstAdj = hurstPersist ? -0.1 : hurstRevert ? 0.15 : 0.0
+    volAdj = relVol >= f_exitVolClimax() ? -0.2 : relVol < f_mfiWtLo() ? 0.2 : 0.0
+    sessFloor = isOpen ? 0.0 : isMorning ? 0.0 : isLunch ? 1.0 : isAfternoon ? 0.0 : isLast ? 0.0 : inPreMkt ? 1.0 : inLondon ? 1.0 : inAsia ? 1.0 : 0.0
+    math.max(sessFloor, math.min(2.0, base + confAdj + sessAdj + htfAdj + regAdj + adxAdj + hurstAdj + volAdj))
+int bosLongOptGates = (not structBlocksLong ? 1 : 0) + (not longOverextended ? 1 : 0)
+int bosShortOptGates = (not structBlocksShort ? 1 : 0) + (not shortOverextended ? 1 : 0)
+float povProxAtr = not na(povLevel) and atr > 0 ? math.abs(close - povLevel) / atr : 99.0
+float povBlockThresh = inPreMkt ? 1.5 : inLondon ? 1.3 : inAsia ? 1.5 : 1.5
+povBlockThresh += adfMeanRevert ? -0.2 : adfTrending ? 0.3 : 0.0
+povBlockThresh += nodeStrength >= 15 ? -0.15 : nodeStrength < 5 ? 0.2 : 0.0
+povBlockThresh += adx < 20 ? -0.1 : adx >= 35 ? 0.2 : 0.0
+povBlockThresh += hurstRevert ? -0.1 : hurstPersist ? 0.15 : 0.0
+povBlockThresh := math.max(0.8, povBlockThresh)
+// A large '< 99' threshold blocked RTH; an explicit ETH gate expresses the intent.
+bool ethPovBlock = inETH and not na(povLevel) and povProxAtr < povBlockThresh
+
+f_validLongBracket(float tp, float sl) =>
+    not na(tp) and not na(sl) and sl < close and tp > close and tp - close >= minProfit
+f_validShortBracket(float tp, float sl) =>
+    not na(tp) and not na(sl) and sl > close and tp < close and close - tp >= minProfit
+
+// Orders are scheduled on close and normally fill next bar. One candidate per bar.
+bool orderDataReady = barstate.isconfirmed and atr > 0 and not na(volume) and volume > 0
+bool canLong = orderDataReady and sessionAllowed and longsEnabled and not isShort
+bool canShort = orderDataReady and sessionAllowed and not isLong
+bool longFiredThisBar = false
+bool shortFiredThisBar = false
+
+// Priority 1: MAIN.
+if canLong and sigL and not macroVetoLong and not longFiredThisBar and not shortFiredThisBar
+    tpCandL = f_starAdjTpLong(inRTH ? mainTpLongAdj : f_sessionTpLong(), confLong)
+    slCandL = f_sessionSlLong()
+    if f_validLongBracket(tpCandL, slCandL)
+        entryBar := bar_index
+        entryAtr := atr
+        activeTp := tpCandL
+        activeSl := slCandL
+        longFiredThisBar := true
+        strategy.entry("MAIN_L_" + str.tostring(bar_index), strategy.long)
+        strategy.exit("MAIN_L_X_" + str.tostring(bar_index), "MAIN_L_" + str.tostring(bar_index), stop=activeSl, limit=activeTp)
+if canShort and sigS and not macroVetoShort and not longFiredThisBar and not shortFiredThisBar
+    tpCandS = f_starAdjTpShort(inRTH ? mainTpShortAdj : f_sessionTpShort(), confShort)
+    slCandS = f_sessionSlShort()
+    if f_validShortBracket(tpCandS, slCandS)
+        entryBar := bar_index
+        entryAtr := atr
+        activeTp := tpCandS
+        activeSl := slCandS
+        shortFiredThisBar := true
+        strategy.entry("MAIN_S_" + str.tostring(bar_index), strategy.short)
+        strategy.exit("MAIN_S_X_" + str.tostring(bar_index), "MAIN_S_" + str.tostring(bar_index), stop=activeSl, limit=activeTp)
+
+// Priority 2: BOS.
+if canLong and bullBOS and bosBuyConf >= bosMinRules and longTrendAlignOk and not longFiredThisBar and not shortFiredThisBar and not dirBlocksLong and not dirBlocksLongFull and not macroVetoLong and not ethPovBlock and bosLongOptGates >= f_bosGateReqLong()
+    tpCandBoL = f_starAdjTpLong(inRTH ? bosTpLongAdj : f_sessionTpLong(), confLong)
+    tpCandBoL := close + (tpCandBoL - close) * f_bosTpMult()
+    slCandBoL = f_sessionSlLong()
+    if f_validLongBracket(tpCandBoL, slCandBoL)
+        entryBar := bar_index
+        entryAtr := atr
+        activeTp := tpCandBoL
+        activeSl := slCandBoL
+        longFiredThisBar := true
+        strategy.entry("BOS_L_" + str.tostring(bar_index), strategy.long)
+        strategy.exit("BOS_L_X_" + str.tostring(bar_index), "BOS_L_" + str.tostring(bar_index), stop=activeSl, limit=activeTp)
+if canShort and bearBOS and bosSellConf >= bosMinRules and shortTrendAlignOk and shortVolumeOk and not longFiredThisBar and not shortFiredThisBar and not dirBlocksShortFull and not macroVetoShort and not ethPovBlock and bosShortOptGates >= f_bosGateReqShort() and confShort >= ssExtraConfShort + 3
+    tpCandBoS = f_starAdjTpShort(inRTH ? bosTpShortAdj : f_sessionTpShort(), confShort)
+    tpCandBoS := close - (close - tpCandBoS) * f_bosTpMult()
+    slCandBoS = f_sessionSlShort()
+    if f_validShortBracket(tpCandBoS, slCandBoS)
+        entryBar := bar_index
+        entryAtr := atr
+        activeTp := tpCandBoS
+        activeSl := slCandBoS
+        shortFiredThisBar := true
+        strategy.entry("BOS_S_" + str.tostring(bar_index), strategy.short)
+        strategy.exit("BOS_S_X_" + str.tostring(bar_index), "BOS_S_" + str.tostring(bar_index), stop=activeSl, limit=activeTp)
+
+// Priority 3: OB. Its structural stop is deliberately distinct from session SL.
+if canLong and obBullTradeFire and not longFiredThisBar and not shortFiredThisBar and not dirBlocksLong and not dirBlocksLongFull and not structBlocksLong and longTrendAlignOk and not longOverextended and not macroVetoLong
+    tpCandObL = f_starAdjTpLong(inRTH ? obTpLongAdj : f_sessionTpLong(), confLong)
+    tpCandObL := close + (tpCandObL - close) * f_obTpMult()
+    slCandObL = obBullSl
+    if f_validLongBracket(tpCandObL, slCandObL)
+        entryBar := bar_index
+        entryAtr := atr
+        activeTp := tpCandObL
+        activeSl := slCandObL
+        longFiredThisBar := true
+        strategy.entry("OB_L_" + str.tostring(bar_index), strategy.long)
+        strategy.exit("OB_L_X_" + str.tostring(bar_index), "OB_L_" + str.tostring(bar_index), stop=activeSl, limit=activeTp)
+if canShort and obBearTradeFire and shortVolumeOk and not longFiredThisBar and not shortFiredThisBar and not dirBlocksShortFull and not structBlocksShort and shortTrendAlignOk and not shortOverextended and not macroVetoShort and confShort >= ssExtraConfShort + 1
+    tpCandObS = f_starAdjTpShort(inRTH ? obTpShortAdj : f_sessionTpShort(), confShort)
+    tpCandObS := close - (close - tpCandObS) * f_obTpMult()
+    slCandObS = obBearSl
+    if f_validShortBracket(tpCandObS, slCandObS)
+        entryBar := bar_index
+        entryAtr := atr
+        activeTp := tpCandObS
+        activeSl := slCandObS
+        shortFiredThisBar := true
+        strategy.entry("OB_S_" + str.tostring(bar_index), strategy.short)
+        strategy.exit("OB_S_X_" + str.tostring(bar_index), "OB_S_" + str.tostring(bar_index), stop=activeSl, limit=activeTp)
+
+// Priority 4: RE.
+if canLong and bullRetestOk and not longFiredThisBar and not shortFiredThisBar and not dirBlocksLong and not dirBlocksLongFull and not structBlocksLong and longTrendAlignOk and not longOverextended and not macroVetoLong
+    reTpRaw = inRTH ? math.max(mainTpLongAdj, close + tpFloorBuy) : f_sessionTpLong()
+    reTpL = f_starAdjTpLong(reTpRaw, confLong)
+    reTpL := close + (reTpL - close) * f_reTpMult()
+    reSlL = f_sessionSlLong()
+    if f_validLongBracket(reTpL, reSlL)
+        entryBar := bar_index
+        entryAtr := atr
+        activeTp := reTpL
+        activeSl := reSlL
+        longFiredThisBar := true
+        strategy.entry("RE_L_" + str.tostring(bar_index), strategy.long)
+        strategy.exit("RE_L_X_" + str.tostring(bar_index), "RE_L_" + str.tostring(bar_index), stop=activeSl, limit=activeTp)
+if canShort and bearRetestOk and not longFiredThisBar and not shortFiredThisBar and shortVolumeOk and not dirBlocksShortFull and not structBlocksShort and shortTrendAlignOk and not shortOverextended and not macroVetoShort and confShort >= ssExtraConfShort + 1
+    reTpRaw = inRTH ? math.min(mainTpShortAdj, close - tpFloorSell) : f_sessionTpShort()
+    reTpS = f_starAdjTpShort(reTpRaw, confShort)
+    reTpS := close - (close - reTpS) * f_reTpMult()
+    reSlS = f_sessionSlShort()
+    if f_validShortBracket(reTpS, reSlS)
+        entryBar := bar_index
+        entryAtr := atr
+        activeTp := reTpS
+        activeSl := reSlS
+        shortFiredThisBar := true
+        strategy.entry("RE_S_" + str.tostring(bar_index), strategy.short)
+        strategy.exit("RE_S_X_" + str.tostring(bar_index), "RE_S_" + str.tostring(bar_index), stop=activeSl, limit=activeTp)
+
+// Priority 5: TRAP; a sweep of lows buys, a sweep of highs sells.
+if canLong and bearSweep and not longFiredThisBar and not shortFiredThisBar and not dirBlocksLong and not dirBlocksLongFull and not structBlocksLong and longTrendAlignOk and not longOverextended and not macroVetoLong and fpHasVolume and (fpDeltaBull or fpBuyRatio >= f_trapFpRatio()) and confLong >= ssExtraConfLong + 1
+    trapTpRaw = inRTH ? math.max(close + (mainTpLongAdj - close) * 0.9, close + tpFloorBuy) : f_sessionTpLong()
+    trapTpL = f_starAdjTpLong(trapTpRaw, confLong)
+    trapTpL := close + (trapTpL - close) * f_trapTpMult()
+    trapSlRawL = math.min(f_sessionSlLong(), low - atr * 0.3)
+    trapSlCapL = isOpen ? 2.5 : isMorning ? 2.0 : isLunch ? 1.8 : isAfternoon ? 2.0 : inAsia ? 1.5 : inLondon ? 1.8 : aerTrending ? 2.2 : 1.8
+    trapSlL = math.max(trapSlRawL, close - atr * trapSlCapL)
+    if f_validLongBracket(trapTpL, trapSlL)
+        entryBar := bar_index
+        entryAtr := atr
+        activeTp := trapTpL
+        activeSl := trapSlL
+        longFiredThisBar := true
+        strategy.entry("TRAP_L_" + str.tostring(bar_index), strategy.long)
+        strategy.exit("TRAP_L_X_" + str.tostring(bar_index), "TRAP_L_" + str.tostring(bar_index), stop=activeSl, limit=activeTp)
+if canShort and bullSweep and not longFiredThisBar and not shortFiredThisBar and shortVolumeOk and not dirBlocksShortFull and not structBlocksShort and shortTrendAlignOk and not shortOverextended and not macroVetoShort and fpHasVolume and (fpDeltaBear or fpSellRatio >= f_trapFpRatio()) and confShort >= ssExtraConfShort + 1
+    trapTpRaw = inRTH ? math.min(close - (close - mainTpShortAdj) * 0.9, close - tpFloorSell) : f_sessionTpShort()
+    trapTpS = f_starAdjTpShort(trapTpRaw, confShort)
+    trapTpS := close - (close - trapTpS) * f_trapTpMult()
+    trapSlRawS = math.max(f_sessionSlShort(), high + atr * 0.3)
+    trapSlCapS = isOpen ? 2.5 : isMorning ? 2.0 : isLunch ? 1.8 : isAfternoon ? 2.0 : inAsia ? 1.5 : inLondon ? 1.8 : aerTrending ? 2.2 : 1.8
+    trapSlS = math.min(trapSlRawS, close + atr * trapSlCapS)
+    if f_validShortBracket(trapTpS, trapSlS)
+        entryBar := bar_index
+        entryAtr := atr
+        activeTp := trapTpS
+        activeSl := trapSlS
+        shortFiredThisBar := true
+        strategy.entry("TRAP_S_" + str.tostring(bar_index), strategy.short)
+        strategy.exit("TRAP_S_X_" + str.tostring(bar_index), "TRAP_S_" + str.tostring(bar_index), stop=activeSl, limit=activeTp)
+
+// Priority 6: OD, only while flat.
+if canLong and odBuyRaw and not longFiredThisBar and not shortFiredThisBar and isFlat and dirScoreFull >= 0 and not macroVetoLong
+    odTpL = f_odTpLong()
+    odSlL = f_odSlLong()
+    if f_validLongBracket(odTpL, odSlL)
+        entryBar := bar_index
+        entryAtr := atr
+        activeTp := odTpL
+        activeSl := odSlL
+        longFiredThisBar := true
+        strategy.entry("OD_L_" + str.tostring(bar_index), strategy.long)
+        strategy.exit("OD_L_X_" + str.tostring(bar_index), "OD_L_" + str.tostring(bar_index), stop=activeSl, limit=activeTp)
+if canShort and odSellRaw and not longFiredThisBar and not shortFiredThisBar and isFlat and dirScoreFull <= 0 and not macroVetoShort
+    odTpS = f_odTpShort()
+    odSlS = f_odSlShort()
+    if f_validShortBracket(odTpS, odSlS)
+        entryBar := bar_index
+        entryAtr := atr
+        activeTp := odTpS
+        activeSl := odSlS
+        shortFiredThisBar := true
+        strategy.entry("OD_S_" + str.tostring(bar_index), strategy.short)
+        strategy.exit("OD_S_X_" + str.tostring(bar_index), "OD_S_" + str.tostring(bar_index), stop=activeSl, limit=activeTp)
+
+// S/R is refreshed after entries, retaining the original one-bar state dependency.
+nearSup := na
+nearRes := na
+float[] srLevels = array.from(pivotS1, pivotS2, pivotPP, orbLocked ? orbLow : na, pmLow, pmMid, vwapDn1, showORBMid and orbLocked ? orbMid : na, showONRange ? onLow : na, showQQQLevels ? qqqLvlDn1 : na, hvbZone1, hvbZone2, hvbZone3, povLevel, valLevel, vahLevel, fvgBullHi, obBullMid, obBearMid, inETH or isOpen ? rthLow : na, fpVAL, ema200)
+float[] resLevels = array.from(pivotR1, pivotR2, pivotPP, orbLocked ? orbHigh : na, pmHigh, pmMid, vwapUp1, showORBMid and orbLocked ? orbMid : na, showONRange ? onHigh : na, showQQQLevels ? qqqLvlUp1 : na, hvbZone1, hvbZone2, hvbZone3, povLevel, vahLevel, valLevel, fvgBearHi, obBullMid, obBearMid, inETH or isOpen ? rthHigh : na, fpVAH, ema200)
+if array.size(vrzHighs) > 0
+    for i = 0 to array.size(vrzHighs) - 1
+        array.push(srLevels, array.get(vrzHighs, i))
+        array.push(srLevels, array.get(vrzLows, i))
+        array.push(resLevels, array.get(vrzHighs, i))
+        array.push(resLevels, array.get(vrzLows, i))
+for lvl in srLevels
+    if not na(lvl) and lvl < close and (na(nearSup) or lvl > nearSup)
+        nearSup := lvl
+for lvl in resLevels
+    if not na(lvl) and lvl > close and (na(nearRes) or lvl < nearRes)
+        nearRes := lvl
+float distToSup = not na(nearSup) ? (close - nearSup) / close * 100 : 99.0
+float distToRes = not na(nearRes) ? (nearRes - close) / close * 100 : 99.0
+f_srNearThresh() => f_dyn(0.1, 0.05, -0.02, -0.03, 0.02, -0.02, 0.02, -0.02, 0.04, 0.2)
+f_srFarThresh() => f_dyn(0.3, 0.1, -0.05, -0.05, 0.05, -0.03, 0.0, 0.0, 0.15, 0.5)
+float srNear = f_srNearThresh()
+float srFar = f_srFarThresh()
+float srBias = 0.0
+if distToSup < srNear and distToRes > srFar
+    srBias := 1.0
+else if distToRes < srNear and distToSup > srFar
+    srBias := -1.0
+else if distToSup < distToRes * 0.5
+    srBias := 0.5
+else if distToRes < distToSup * 0.5
+    srBias := -0.5
+float dirScore = dirScoreFull + srBias
+
+absHighVol = fpHasVolume and fpTotalVol > avgVol * f_exitVolClimax()
+absDeltaFlat = fpHasVolume and math.abs(fpDelta) / fpTotalVol < 0.2
+absSmallMove = csRange <= 4.0 * syminfo.mintick
+absSignal = absHighVol and absDeltaFlat and absSmallMove
+absBull = absSignal and (not na(fpPocMid) ? close >= fpPocMid : close > open)
+absBear = absSignal and (not na(fpPocMid) ? close < fpPocMid : close <= open)
+dirScoreFull += absBull ? absWt : absBear ? -absWt : 0.0
+dirScore += absBull ? absWt : absBear ? -absWt : 0.0
+f_aggRatioThresh(bool isBuy) =>
+    base = 4.5
+    regimeAdj = isBuy ? (aerDowntrend ? -0.5 : aerUptrend ? 0.5 : 0.0) : (aerUptrend ? -0.5 : aerDowntrend ? 0.5 : 0.0)
+    adxAdj = adx >= 35 ? 0.3 : adx < 20 ? -0.3 : 0.0
+    sessAdj = isOpen ? 0.5 : isMorning ? -0.15 : isLunch ? 0.0 : isAfternoon ? 0.0 : isLast ? 0.15 : inPreMkt ? 0.3 : inLondon ? 0.25 : inAsia ? 0.4 : 0.0
+    math.max(3.0, math.min(6.5, base + regimeAdj + adxAdj + sessAdj))
+f_aggVolThresh() => f_dyn(2.0, 0.5, 0.0, -0.3, 0.3, -0.3, 0.0, 0.0, 1.3, 3.0)
+aggBuy = fpHasVolume and fpBuyRatio >= f_aggRatioThresh(true) and fpTotalVol > avgVol * f_aggVolThresh()
+aggSell = fpHasVolume and fpSellRatio >= f_aggRatioThresh(false) and fpTotalVol > avgVol * f_aggVolThresh()
+
+// Rolling OHLC-volume proxy; its candle-direction split is not bid/ask footprint.
+hvbHi = ta.highest(high, math.min(hvbLookback, bar_index + 1))
+hvbLo = ta.lowest(low, math.min(hvbLookback, bar_index + 1))
+float hvbBinSize = hvbHi > hvbLo ? (hvbHi - hvbLo) / hvbBins : 0.0
+var array<float> hvbBinCalc = array.new_float(0)
+var array<float> hvbBinBuy = array.new_float(0)
+var array<float> hvbBinSell = array.new_float(0)
+hvbZone1 := na
+hvbZone2 := na
+hvbZone3 := na
+povLevel := na
+vahLevel := na
+valLevel := na
+pocBuyPct := 50.0
+pocRawBuy := 0.0
+pocRawSell := 0.0
+nodeStrength := 0.0
+if hvbBinSize > 0
+    array.clear(hvbBinCalc)
+    array.clear(hvbBinBuy)
+    array.clear(hvbBinSell)
+    for i = 0 to hvbBins - 1
+        array.push(hvbBinCalc, 0.0)
+        array.push(hvbBinBuy, 0.0)
+        array.push(hvbBinSell, 0.0)
+    // Partial history is valid; unavailable bars must not become an na array index.
+    for i = 0 to math.min(hvbLookback - 1, bar_index)
+        if not na(close[i])
+            int bIdx = int(math.max(0, math.min(math.floor((close[i] - hvbLo) / hvbBinSize), hvbBins - 1)))
+            float bVol = nz(volume[i])
+            array.set(hvbBinCalc, bIdx, array.get(hvbBinCalc, bIdx) + bVol)
+            if close[i] > open[i]
+                array.set(hvbBinBuy, bIdx, array.get(hvbBinBuy, bIdx) + bVol)
+            else if close[i] < open[i]
+                array.set(hvbBinSell, bIdx, array.get(hvbBinSell, bIdx) + bVol)
+            else
+                array.set(hvbBinBuy, bIdx, array.get(hvbBinBuy, bIdx) + bVol * 0.5)
+                array.set(hvbBinSell, bIdx, array.get(hvbBinSell, bIdx) + bVol * 0.5)
+    float hvbTotalVol = 0.0
+    int pocIdx = 0
+    float pocVol = 0.0
+    for j = 0 to hvbBins - 1
+        float bv = array.get(hvbBinCalc, j)
+        hvbTotalVol += bv
+        if bv > pocVol
+            pocVol := bv
+            pocIdx := j
+    if hvbTotalVol > 0
+        hvbZone1 := hvbLo + (pocIdx + 0.5) * hvbBinSize
+        pocRawBuy := array.get(hvbBinBuy, pocIdx)
+        pocRawSell := array.get(hvbBinSell, pocIdx)
+        pocBuyPct := pocVol > 0 ? pocRawBuy / pocVol * 100 : 50.0
+        float vaTarget = hvbTotalVol * 0.70
+        float vaVol = pocVol
+        int vaLowIdx = pocIdx
+        int vaHighIdx = pocIdx
+        for step = 0 to hvbBins - 1
+            if vaVol >= vaTarget or (vaLowIdx <= 0 and vaHighIdx >= hvbBins - 1)
+                break
+            float volBelow = vaLowIdx > 0 ? array.get(hvbBinCalc, vaLowIdx - 1) : 0.0
+            float volAbove = vaHighIdx < hvbBins - 1 ? array.get(hvbBinCalc, vaHighIdx + 1) : 0.0
+            if volBelow >= volAbove and vaLowIdx > 0
+                vaLowIdx -= 1
+                vaVol += volBelow
+            else if vaHighIdx < hvbBins - 1
+                vaHighIdx += 1
+                vaVol += volAbove
+            else if vaLowIdx > 0
+                vaLowIdx -= 1
+                vaVol += volBelow
+        vahLevel := hvbLo + (vaHighIdx + 1) * hvbBinSize
+        valLevel := hvbLo + vaLowIdx * hvbBinSize
+        int povIdx = pocIdx
+        float povMinVol = pocVol
+        for j = vaLowIdx to vaHighIdx
+            if j != pocIdx and array.get(hvbBinCalc, j) < povMinVol
+                povMinVol := array.get(hvbBinCalc, j)
+                povIdx := j
+        povLevel := hvbLo + (povIdx + 0.5) * hvbBinSize
+        nodeStrength := pocVol / hvbTotalVol * 100
+        array.set(hvbBinCalc, pocIdx, 0.0)
+        for rank = 0 to 1
+            int maxIdx = 0
+            float maxVal = 0.0
+            for j = 0 to hvbBins - 1
+                if array.get(hvbBinCalc, j) > maxVal
+                    maxVal := array.get(hvbBinCalc, j)
+                    maxIdx := j
+            if maxVal > 0
+                float zMid = hvbLo + (maxIdx + 0.5) * hvbBinSize
+                if rank == 0
+                    hvbZone2 := zMid
+                else
+                    hvbZone3 := zMid
+                array.set(hvbBinCalc, maxIdx, 0.0)
+
+divRsi = ta.rsi(close, 14)
+phPrice = ta.pivothigh(high, divLookback, divLookback)
+plPrice = ta.pivotlow(low, divLookback, divLookback)
+phRsi = ta.pivothigh(divRsi, divLookback, divLookback)
+plRsi = ta.pivotlow(divRsi, divLookback, divLookback)
+var float prevPivotHigh = na
+var float prevPivotHighRsi = na
+var float prevPivotLow = na
+var float prevPivotLowRsi = na
+var float lastPH = na
+var float lastPHRsi = na
+var float lastPL = na
+var float lastPLRsi = na
+if not na(phPrice)
+    prevPivotHigh := lastPH
+    prevPivotHighRsi := lastPHRsi
+    lastPH := phPrice
+    lastPHRsi := phRsi
+if not na(plPrice)
+    prevPivotLow := lastPL
+    prevPivotLowRsi := lastPLRsi
+    lastPL := plPrice
+    lastPLRsi := plRsi
+bearDiv = not na(phPrice) and not na(prevPivotHigh) and not na(lastPHRsi) and not na(prevPivotHighRsi) and lastPH > prevPivotHigh and lastPHRsi < prevPivotHighRsi
+bullDiv = not na(plPrice) and not na(prevPivotLow) and not na(lastPLRsi) and not na(prevPivotLowRsi) and lastPL < prevPivotLow and lastPLRsi > prevPivotLowRsi
+dirScoreFull += bullDiv ? regDivWt : bearDiv ? -regDivWt : 0.0
+dirScore += bullDiv ? regDivWt : bearDiv ? -regDivWt : 0.0
+fpDivBear = fpHasVolume and not na(phPrice) and not na(prevPivotHigh) and lastPH > prevPivotHigh and cumFpDelta < cumFpDelta[10] and fpTotalVol > avgVol * f_divVolBear()
+fpDivBull = fpHasVolume and not na(plPrice) and not na(prevPivotLow) and lastPL < prevPivotLow and cumFpDelta > cumFpDelta[10] and fpTotalVol > avgVol * f_divVolBull()
+bool hiddenBullDiv = not na(plPrice) and not na(prevPivotLow) and not na(lastPLRsi) and not na(prevPivotLowRsi) and lastPL > prevPivotLow and lastPLRsi < prevPivotLowRsi
+bool hiddenBearDiv = not na(phPrice) and not na(prevPivotHigh) and not na(lastPHRsi) and not na(prevPivotHighRsi) and lastPH < prevPivotHigh and lastPHRsi > prevPivotHighRsi
+float hidDivWt = aerTrending and adx >= 30 ? 0.8 : aerTrending ? 0.6 : isOpen ? 0.5 : isMorning ? 0.45 : isLunch ? 0.3 : isAfternoon ? 0.35 : inAsia ? 0.2 : aerChoppy ? 0.2 : 0.5
+dirScoreFull += hiddenBullDiv ? hidDivWt : hiddenBearDiv ? -hidDivWt : 0.0
+dirScore += hiddenBullDiv ? hidDivWt : hiddenBearDiv ? -hidDivWt : 0.0
+
+// Smart-exit diagnostics are preserved but do not close positions in this baseline.
+bool inTradeLong = isLong and bar_index > entryBar
+bool inTradeShort = isShort and bar_index > entryBar
+var float peakLongProfitAtr = 0.0
+var float peakShortProfitAtr = 0.0
+if not isLong
+    peakLongProfitAtr := 0.0
+if not isShort
+    peakShortProfitAtr := 0.0
+float curLongProfitAtr = isLong and not na(posAvgPrice) ? (close - posAvgPrice) / nz(entryAtr, atr) : 0.0
+float curShortProfitAtr = isShort and not na(posAvgPrice) ? (posAvgPrice - close) / nz(entryAtr, atr) : 0.0
+if isLong
+    peakLongProfitAtr := math.max(peakLongProfitAtr, curLongProfitAtr)
+if isShort
+    peakShortProfitAtr := math.max(peakShortProfitAtr, curShortProfitAtr)
+float tpDistLong = isLong and not na(activeTp) and not na(posAvgPrice) and activeTp > posAvgPrice ? activeTp - posAvgPrice : 1.0
+float tpDistShort = isShort and not na(activeTp) and not na(posAvgPrice) and posAvgPrice > activeTp ? posAvgPrice - activeTp : 1.0
+float tpProgressLong = isLong ? math.max(0.0, curLongProfitAtr * nz(entryAtr, atr) / tpDistLong) : 0.0
+float tpProgressShort = isShort ? math.max(0.0, curShortProfitAtr * nz(entryAtr, atr) / tpDistShort) : 0.0
+
+f_exitProtection() =>
+    smtPBar = isOpen ? 1.2 : isMorning ? 1.0 : inAsia ? 0.4 : isLunch ? 0.6 : isAfternoon ? 0.8 : aerTrending and adx >= 30 ? 1.0 : aerChoppy ? 0.5 : 0.8
+    smtHBar = isOpen ? 5.0 : isMorning ? 4.5 : inAsia ? 2.0 : isLunch ? 3.0 : isAfternoon ? 3.5 : aerTrending and adx >= 30 ? 5.0 : aerChoppy ? 2.5 : 4.0
+    bosPBar = isOpen ? 2.5 : isMorning ? 2.0 : isLunch ? 0.8 : isAfternoon ? 1.5 : inAsia ? 0.5 : aerTrending and adx >= 30 ? 2.0 : aerChoppy ? 0.6 : hurstPersist ? 1.8 : 1.2
+    bosHBar = isOpen ? 8.0 : isMorning ? 7.0 : isLunch ? 4.0 : isAfternoon ? 5.0 : inAsia ? 3.0 : aerTrending and adx >= 30 ? 7.0 : aerChoppy ? 3.0 : 5.0
+    regPBar = isOpen ? 2.0 : isMorning ? 1.5 : isLunch ? 0.5 : isAfternoon ? 1.0 : inAsia ? 0.5 : aerTrending and adx >= 30 ? 1.5 : aerChoppy ? 0.3 : 1.0
+    regHBar = isOpen ? 7.0 : isMorning ? 6.0 : isLunch ? 3.0 : isAfternoon ? 4.0 : inAsia ? 2.5 : aerTrending and adx >= 30 ? 6.0 : aerChoppy ? 2.5 : 4.0
+    sqzPBar = isOpen ? 1.5 : isMorning ? 1.2 : isLunch ? 0.5 : isAfternoon ? 0.8 : inAsia ? 0.4 : aerTrending and adx >= 30 ? 1.2 : aerChoppy ? 0.4 : 0.8
+    sqzHBar = isOpen ? 6.0 : isMorning ? 5.0 : isLunch ? 3.0 : isAfternoon ? 4.0 : inAsia ? 2.0 : aerTrending and adx >= 30 ? 5.0 : aerChoppy ? 2.5 : 4.0
+    divPBar = isOpen ? 1.0 : isMorning ? 0.8 : isLunch ? 0.3 : isAfternoon ? 0.5 : inAsia ? 0.3 : aerTrending and adx >= 30 ? 0.8 : aerChoppy ? 0.3 : 0.5
+    divHBar = isOpen ? 5.0 : isMorning ? 4.0 : isLunch ? 2.5 : isAfternoon ? 3.0 : inAsia ? 2.0 : aerTrending and adx >= 30 ? 4.0 : aerChoppy ? 2.0 : 3.0
+    orbPBar = isMorning ? 1.5 : isOpen ? 1.0 : isAfternoon ? 0.5 : 0.3
+    orbHBar = isMorning ? 5.0 : isOpen ? 4.0 : isAfternoon ? 3.0 : 2.0
+    absPBar = isOpen ? 1.2 : isMorning ? 1.0 : isLunch ? 0.4 : isAfternoon ? 0.6 : inAsia ? 0.3 : aerTrending and adx >= 30 ? 1.0 : aerChoppy ? 0.3 : 0.6
+    absHBar = isOpen ? 5.0 : isMorning ? 4.0 : isLunch ? 2.5 : isAfternoon ? 3.0 : inAsia ? 2.0 : aerTrending and adx >= 30 ? 4.0 : aerChoppy ? 2.0 : 3.0
+    [smtPBar, smtHBar, bosPBar, bosHBar, regPBar, regHBar, sqzPBar, sqzHBar, divPBar, divHBar, orbPBar, orbHBar, absPBar, absHBar]
+f_exitBuyScore() =>
+    [smtPBar, smtHBar, bosPBar, bosHBar, regPBar, regHBar, sqzPBar, sqzHBar, divPBar, divHBar, orbPBar, orbHBar, absPBar, absHBar] = f_exitProtection()
+    p1 = inTradeLong and high > high[1] and close < close[1]
+    p2 = inTradeLong and close < open and close < open[1] and open > close[1] and open - close > math.abs(close[1] - open[1])
+    p3 = inTradeLong and volume[1] > avgVol * f_exitVolClimax() and close[1] > open[1] and close < open
+    p4 = inTradeLong and high < high[1] and close < open
+    p5 = inTradeLong and csUpperWk > csBody * 1.5 and close < close[1]
+    p6 = inTradeLong and bullSweep and not (curLongProfitAtr > 0.5 and htfConfScore >= 3.0)
+    p7 = inTradeLong and fpDivBear
+    p8 = inTradeLong and aggSell and not (curLongProfitAtr > 0.5 and htfConfScore >= 3.0)
+    p9 = inTradeLong and bearRetestOk
+    p10 = inTradeLong and macdBear and macdHist < macdHist[1] and not (curLongProfitAtr > 0.5 and htfConfScore >= 3.0)
+    p11 = inTradeLong and chochBear
+    p12 = inTradeLong and smtBear and not (curLongProfitAtr > smtPBar and htfConfScore >= smtHBar)
+    p13 = inTradeLong and belowPoV and close < open and not (curLongProfitAtr > 0.5 and htfConfScore >= 3.0)
+    p14 = inTradeLong and bearBOS and not (curLongProfitAtr > bosPBar and htfConfScore >= bosHBar)
+    p15 = inTradeLong and aerDowntrend and not aerDowntrend[1] and not (curLongProfitAtr > regPBar and htfConfScore >= regHBar)
+    p16 = inTradeLong and sqzFired and sqzMom < 0 and not (curLongProfitAtr > sqzPBar and htfConfScore >= sqzHBar)
+    p17 = inTradeLong and hiddenBearDiv and not (curLongProfitAtr > divPBar and htfConfScore >= divHBar)
+    p18 = inTradeLong and useORB and orbLocked and orbBrokenUp[1] and close < orbHigh and not (curLongProfitAtr > orbPBar and htfConfScore >= orbHBar)
+    p19 = inTradeLong and absBear and not (curLongProfitAtr > absPBar and htfConfScore >= absHBar)
+    p20 = inTradeLong and bearDiv and not (curLongProfitAtr > divPBar and htfConfScore >= divHBar)
+    (p1?1:0)+(p2?1:0)+(p3?1:0)+(p4?1:0)+(p5?1:0)+(p6?1:0)+(p7?1:0)+(p8?1:0)+(p9?1:0)+(p10?1:0)+(p11?1:0)+(p12?1:0)+(p13?1:0)+(p14?1:0)+(p15?1:0)+(p16?1:0)+(p17?1:0)+(p18?1:0)+(p19?1:0)+(p20?1:0)
+f_exitSellScore() =>
+    [smtPBar, smtHBar, bosPBar, bosHBar, regPBar, regHBar, sqzPBar, sqzHBar, divPBar, divHBar, orbPBar, orbHBar, absPBar, absHBar] = f_exitProtection()
+    p1 = inTradeShort and low < low[1] and close > close[1]
+    p2 = inTradeShort and close > open and close > close[1] and open < open[1] and close - open > math.abs(open[1] - close[1])
+    p3 = inTradeShort and volume[1] > avgVol * f_exitVolClimax() and close[1] < open[1] and close > open
+    p4 = inTradeShort and low > low[1] and close > open
+    p5 = inTradeShort and csLowerWk > csBody * 1.5 and close > close[1]
+    p6 = inTradeShort and bearSweep and not (curShortProfitAtr > 0.5 and htfConfScore <= -3.0)
+    p7 = inTradeShort and fpDivBull
+    p8 = inTradeShort and aggBuy and not (curShortProfitAtr > 0.5 and htfConfScore <= -3.0)
+    p9 = inTradeShort and bullRetestOk
+    p10 = inTradeShort and macdBull and macdHist > macdHist[1] and not (curShortProfitAtr > 0.5 and htfConfScore <= -3.0)
+    p11 = inTradeShort and chochBull
+    p12 = inTradeShort and smtBull and not (curShortProfitAtr > smtPBar and htfConfScore <= -smtHBar)
+    p13 = inTradeShort and abovePoV and close > open and not (curShortProfitAtr > 0.5 and htfConfScore <= -3.0)
+    p14 = inTradeShort and bullBOS and not (curShortProfitAtr > bosPBar and htfConfScore <= -bosHBar)
+    p15 = inTradeShort and aerUptrend and not aerUptrend[1] and not (curShortProfitAtr > regPBar and htfConfScore <= -regHBar)
+    p16 = inTradeShort and sqzFired and sqzMom > 0 and not (curShortProfitAtr > sqzPBar and htfConfScore <= -sqzHBar)
+    p17 = inTradeShort and hiddenBullDiv and not (curShortProfitAtr > divPBar and htfConfScore <= -divHBar)
+    p18 = inTradeShort and useORB and orbLocked and orbBrokenDown[1] and close > orbLow and not (curShortProfitAtr > orbPBar and htfConfScore <= -orbHBar)
+    p19 = inTradeShort and absBull and not (curShortProfitAtr > absPBar and htfConfScore <= -absHBar)
+    p20 = inTradeShort and bullDiv and not (curShortProfitAtr > divPBar and htfConfScore <= -divHBar)
+    (p1?1:0)+(p2?1:0)+(p3?1:0)+(p4?1:0)+(p5?1:0)+(p6?1:0)+(p7?1:0)+(p8?1:0)+(p9?1:0)+(p10?1:0)+(p11?1:0)+(p12?1:0)+(p13?1:0)+(p14?1:0)+(p15?1:0)+(p16?1:0)+(p17?1:0)+(p18?1:0)+(p19?1:0)+(p20?1:0)
+int exitBuyScore = f_exitBuyScore()
+int exitSellScore = f_exitSellScore()
+
+f_dynBuyExitThresh() =>
+    base = 12.0
+    pnlAdj = curLongProfitAtr >= 2.0 ? 2.0 : curLongProfitAtr >= 1.0 ? 1.0 : curLongProfitAtr >= 0.5 ? 0.5 : 0.0
+    tpAdj = tpProgressLong >= 0.7 ? 1.0 : tpProgressLong >= 0.4 ? 0.5 : 0.0
+    sessAdj = isOpen ? 0.5 : isMorning ? 0.3 : isLunch ? -0.3 : isAfternoon ? 0.0 : isLast ? 0.2 : inPreMkt ? -0.4 : inLondon ? -0.4 : inAsia ? -0.25 : 0.0
+    regAdj = aerUptrend ? 0.3 : aerDowntrend ? -0.3 : aerChoppy ? -0.2 : 0.0
+    adxAdj = adx >= 35 ? (aerUptrend ? 0.2 : aerDowntrend ? -0.3 : 0.0) : adx < 20 ? -0.2 : 0.0
+    hurstAdj = hurstPersist ? 0.2 : hurstRevert ? -0.2 : 0.0
+    volAdj = relVol >= 2.0 ? -0.2 : relVol < 0.7 ? 0.2 : 0.0
+    adfAdj = adfMeanRevert ? -0.3 : adfTrending ? 0.2 : 0.0
+    flowAdj = fpDeltaBull ? 0.2 : fpDeltaBear ? -0.2 : 0.0
+    nodeAdj = nodeStrength >= 15 ? 0.15 : nodeStrength < 5 ? -0.15 : 0.0
+    povAdj = nearPoV ? -0.3 : 0.0
+    math.max(3.5, math.min(10.0, base + pnlAdj + tpAdj + sessAdj + regAdj + adxAdj + hurstAdj + volAdj + adfAdj + flowAdj + nodeAdj + povAdj))
+f_dynSellExitThresh() =>
+    base = 12.0
+    pnlAdj = curShortProfitAtr >= 2.0 ? 2.0 : curShortProfitAtr >= 1.0 ? 1.0 : curShortProfitAtr >= 0.5 ? 0.5 : 0.0
+    tpAdj = tpProgressShort >= 0.7 ? 1.0 : tpProgressShort >= 0.4 ? 0.5 : 0.0
+    sessAdj = isOpen ? 0.5 : isMorning ? 0.3 : isLunch ? -0.3 : isAfternoon ? 0.0 : isLast ? 0.2 : inPreMkt ? -0.4 : inLondon ? -0.4 : inAsia ? -0.25 : 0.0
+    regAdj = aerDowntrend ? 0.3 : aerUptrend ? -0.3 : aerChoppy ? -0.2 : 0.0
+    adxAdj = adx >= 35 ? (aerDowntrend ? 0.2 : aerUptrend ? -0.3 : 0.0) : adx < 20 ? -0.2 : 0.0
+    hurstAdj = hurstPersist ? 0.2 : hurstRevert ? -0.2 : 0.0
+    volAdj = relVol >= 2.0 ? -0.2 : relVol < 0.7 ? 0.2 : 0.0
+    adfAdj = adfMeanRevert ? -0.3 : adfTrending ? 0.2 : 0.0
+    flowAdj = fpDeltaBear ? 0.2 : fpDeltaBull ? -0.2 : 0.0
+    nodeAdj = nodeStrength >= 15 ? 0.15 : nodeStrength < 5 ? -0.15 : 0.0
+    povAdj = nearPoV ? -0.3 : 0.0
+    math.max(3.5, math.min(10.0, base + pnlAdj + tpAdj + sessAdj + regAdj + adxAdj + hurstAdj + volAdj + adfAdj + flowAdj + nodeAdj + povAdj))
+float buyExitThresh = f_dynBuyExitThresh()
+float sellExitThresh = f_dynSellExitThresh()
+f_profitGateRetainBuy() =>
+    base = 0.40
+    macroAdj = htfConfScore >= (isOpen ? 5.0 : 4.0) ? -0.12 : htfConfScore >= (isOpen ? 3.0 : 2.0) ? -0.06 : htfConfScore <= -(isOpen ? 5.0 : 4.0) ? 0.15 : htfConfScore <= -(isOpen ? 3.0 : 2.0) ? 0.08 : 0.0
+    tpAdj = tpProgressLong >= 0.7 ? -0.10 : tpProgressLong >= 0.4 ? -0.05 : 0.0
+    regimeAdj = aerUptrend ? -0.08 : aerDowntrend ? 0.10 : aerChoppy ? 0.05 : 0.0
+    flowAdj = fpDeltaBull ? -0.03 : fpDeltaBear ? 0.05 : 0.0
+    sessAdj = isOpen ? -0.05 : isMorning ? 0.015 : isLunch ? 0.05 : isAfternoon ? 0.025 : isLast ? -0.015 : inPreMkt ? 0.05 : inLondon ? 0.04 : inAsia ? 0.05 : 0.0
+    adxAdj = adx >= 35 ? -0.05 : adx < 20 ? 0.05 : 0.0
+    hurstAdj = hurstPersist ? -0.05 : hurstRevert ? 0.05 : 0.0
+    adfAdj = adfMeanRevert ? 0.05 : adfTrending ? -0.03 : 0.0
+    nodeAdj = nodeStrength >= 15 ? -0.03 : nodeStrength < 5 ? 0.03 : 0.0
+    povAdj = nearPoV ? 0.05 : 0.0
+    math.max(0.15, math.min(0.65, base + macroAdj + tpAdj + regimeAdj + flowAdj + sessAdj + adxAdj + hurstAdj + adfAdj + nodeAdj + povAdj))
+f_profitGateRetainSell() =>
+    base = 0.40
+    macroAdj = htfConfScore <= -(isOpen ? 5.0 : 4.0) ? -0.12 : htfConfScore <= -(isOpen ? 3.0 : 2.0) ? -0.06 : htfConfScore >= (isOpen ? 5.0 : 4.0) ? 0.15 : htfConfScore >= (isOpen ? 3.0 : 2.0) ? 0.08 : 0.0
+    tpAdj = tpProgressShort >= 0.7 ? -0.10 : tpProgressShort >= 0.4 ? -0.05 : 0.0
+    regimeAdj = aerDowntrend ? -0.08 : aerUptrend ? 0.10 : aerChoppy ? 0.05 : 0.0
+    flowAdj = fpDeltaBear ? -0.03 : fpDeltaBull ? 0.05 : 0.0
+    sessAdj = isOpen ? -0.05 : isMorning ? 0.015 : isLunch ? 0.05 : isAfternoon ? 0.025 : isLast ? -0.015 : inPreMkt ? 0.05 : inLondon ? 0.04 : inAsia ? 0.05 : 0.0
+    adxAdj = adx >= 35 ? -0.05 : adx < 20 ? 0.05 : 0.0
+    hurstAdj = hurstPersist ? -0.05 : hurstRevert ? 0.05 : 0.0
+    adfAdj = adfMeanRevert ? 0.05 : adfTrending ? -0.03 : 0.0
+    nodeAdj = nodeStrength >= 15 ? -0.03 : nodeStrength < 5 ? 0.03 : 0.0
+    povAdj = nearPoV ? 0.05 : 0.0
+    math.max(0.15, math.min(0.65, base + macroAdj + tpAdj + regimeAdj + flowAdj + sessAdj + adxAdj + hurstAdj + adfAdj + nodeAdj + povAdj))
+bool buyPatternExitAllowed = curLongProfitAtr < 0.1 or (peakLongProfitAtr > 0.3 and curLongProfitAtr < peakLongProfitAtr * f_profitGateRetainBuy())
+bool sellPatternExitAllowed = curShortProfitAtr < 0.1 or (peakShortProfitAtr > 0.3 and curShortProfitAtr < peakShortProfitAtr * f_profitGateRetainSell())
+bool smartExitL = false
+bool smartExitS = false
+
+// Expose diagnostics without implying that dormant pattern exits execute orders.
+plot(dirScore, "Direction score (post-entry diagnostic)", display=display.data_window)
+plot(exitBuyScore, "Long exit patterns / 20 (diagnostic only)", display=display.data_window)
+plot(exitSellScore, "Short exit patterns / 20 (diagnostic only)", display=display.data_window)
+plot(buyExitThresh, "Long exit threshold (inactive)", display=display.data_window)
+plot(sellExitThresh, "Short exit threshold (inactive)", display=display.data_window)
+plot(buyPatternExitAllowed ? 1 : 0, "Long profit gate (inactive)", display=display.data_window)
+plot(sellPatternExitAllowed ? 1 : 0, "Short profit gate (inactive)", display=display.data_window)
+plot(smartExitL or smartExitS ? 1 : 0, "Smart exits enabled: 0 = OFF", display=display.data_window)
+plot(fpHasVolume ? 1 : 0, "Footprint available: 1 = YES", display=display.data_window)

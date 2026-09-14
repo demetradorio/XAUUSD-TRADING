@@ -1,6 +1,14 @@
 # XAUUSD Active Scalper M5–M15 — Pine Script v6
 
-**Kode terbaru: [`ict_xauusd_v6.pine`](ict_xauusd_v6.pine).** Versi ini mengganti rangkaian ICT lima tahap yang sangat ketat dengan dua jalur entry lebih sederhana: **pullback EMA atau sweep-reclaim lokal, searah trend**. Tujuannya membuka lebih banyak *kesempatan setup*, bukan memaksa trade setiap candle.
+## Strategi terpisah: XAU Scalper v3
+
+[`xau_scalper_v3.pine`](xau_scalper_v3.pine) memuat port metode NQ/MNQ yang diberikan pengguna: **MAIN, BOS, OB, RE, TRAP, OD**, dengan bracket SL/TP individual dan 20 pola exit diagnostik. Baca [panduan, koreksi teknis, dan rencana validasi v3](docs/xau-scalper-v3.md) sebelum menggunakannya. Ini **bukan hasil optimasi atau backtest baru**; kompilasi dan eksekusi native TradingView belum diverifikasi. Memerlukan paket TradingView Premium/Ultimate untuk `request.footprint()`.
+
+File Active Scalper dan ICT ketat tidak diubah. **Batas risiko dan kalender wajib yang dijelaskan di bawah berlaku untuk Active Scalper, bukan otomatis untuk v3.** V3 masih mempertahankan sizing tetap, pyramiding 20, dan proxy pasar NQ dari metode asal sebagai baseline penelitian.
+
+## Active Scalper
+
+**Kode Active Scalper: [`ict_xauusd_v6.pine`](ict_xauusd_v6.pine).** Versi ini mengganti rangkaian ICT lima tahap yang sangat ketat dengan dua jalur entry lebih sederhana: **pullback EMA atau sweep-reclaim lokal, searah trend**. Tujuannya membuka lebih banyak *kesempatan setup*, bukan memaksa trade setiap candle.
 
 **Jumlah trade dan win rate baru belum dibuktikan pada empat bulan data Anda. Tidak ada jaminan setiap trade menang atau win rate >50%.** Target lebih dekat mengubah distribusi profit/rugi; win rate saja tidak cukup untuk menilai strategi.
 
@@ -112,7 +120,7 @@ pnpm install --frozen-lockfile
 pnpm test
 ```
 
-`pnpm test` menjalankan tes Python dan `tests/pine_smoke.cjs`. PineTS **0.9.33** adalah dependensi pengembangan berlisensi AGPL-3.0; tidak diperlukan untuk menempelkan script ke TradingView. Fixture M5 menguji alur buy/sell, default kalender terkunci, dan pemblokiran kedua order oleh berita pada fixture Desember. Provider fixture memasok agregasi M15/H1 lokal, bukan memakai ulang candle M5 sebagai HTF.
+`pnpm test` menjalankan tes Python, `tests/pine_smoke.cjs`, dan `tests/xau_v3_smoke.cjs`. [Cakupan dan keterbatasan uji v3](docs/xau-scalper-v3.md#verifikasi-lokal-dan-batasnya) dijelaskan terpisah. PineTS **0.9.33** adalah dependensi pengembangan berlisensi AGPL-3.0; tidak diperlukan untuk menempelkan script ke TradingView. Fixture M5 Active Scalper menguji alur buy/sell, default kalender terkunci, dan pemblokiran kedua order oleh berita pada fixture Desember. Provider fixture memasok agregasi M15/H1 lokal, bukan memakai ulang candle M5 sebagai HTF.
 
 **Cakupan smoke test terbatas, walaupun perintah selesai sukses:**
 
