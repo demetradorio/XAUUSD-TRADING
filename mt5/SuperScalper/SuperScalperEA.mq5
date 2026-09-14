@@ -222,8 +222,8 @@ void SCPump()
    int budget=16;
    while(g_cursor<=last && budget>0)
    {
-      SCMarket input; string reason="";
-      if(!g_data.ReadBar(g_queue[g_cursor],input,reason))
+      SCMarket snapshot; string reason="";
+      if(!g_data.ReadBar(g_queue[g_cursor],snapshot,reason))
       {
          SCStatus("DATA BELUM SIAP / ENTRY DIBLOKIR: "+reason);
          g_lastDataRetry=GetTickCount64(); g_pumping=false; return;
@@ -231,7 +231,7 @@ void SCPump()
       SCSignal candidate;
       int side=g_bootstrapping?2:g_execution.PositionSide();
       int before=g_engine.BarsProcessed();
-      bool ready=g_engine.Process(input,side,candidate);
+      bool ready=g_engine.Process(snapshot,side,candidate);
       if(!ready && g_engine.BarsProcessed()==before)
       {
          SCStatus("Bar ditolak mesin (urutan/data tidak valid); entry diblokir.");

@@ -4,6 +4,7 @@
 struct SCPlans
 {
    SCSignal plans[6];
+   SCPlans() { for(int i=0;i<6;i++) SCClearSignal(plans[i]); }
 };
 
 bool SCPlanValid(const SCSignal &plan,const double minProfit)

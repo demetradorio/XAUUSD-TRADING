@@ -1,7 +1,8 @@
 #ifndef SUPER_SCALPER_TYPES_MQH
 #define SUPER_SCALPER_TYPES_MQH
 
-const int SC_HISTORY = 512;
+// MQL5 array dimensions must be compile-time literals, so the ring size is a macro.
+#define SC_HISTORY 512
 const double SC_NA = 1.0e100;
 
 bool SCValid(const double value)

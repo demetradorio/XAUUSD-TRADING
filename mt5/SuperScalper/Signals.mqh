@@ -11,7 +11,8 @@ class SCEngine
 private:
    SCConfig cfg;
    SCIndicators ind;
-   SCMarket market, marketHistory[SC_HISTORY];
+   SCMarket market;
+   SCMarket marketHistory[SC_HISTORY];
    SCIndicatorFrame f,p1,p2,p3,p4;
    SCBar b,b1,b2,b3,b4;
    SCSession s,previousSession;
@@ -817,8 +818,8 @@ private:
       double threshold=1+(conf>=6?-.5:0)+phase+(h>=(s.open?5:4)?-.3:h<=-(s.open?3:2)?.3:0)
          +(aligned?-.15:opposed?.2:choppy?.15:0)+(f.adx>=30?-.2:f.adx<20?.2:0)
          +(hurstPersist?-.1:hurstRevert?.15:0)+(f.relVol>=VolClimax()?-.2:f.relVol<MfiWtLo()?.2:0);
-      double floor=Phase(0,0,1,0,0,1,side>0?.5:1,side>0?.5:1);
-      return SCClamp(threshold,floor,2);
+      double minimum=Phase(0,0,1,0,0,1,side>0?.5:1,side>0?.5:1);
+      return SCClamp(threshold,minimum,2);
    }
 
    double OdStop(int side)
@@ -841,8 +842,8 @@ private:
          target=Below(target,market.prevDayLow); target=Below(target,onLow); target=Below(target,pivotS1);
          if(orbLocked) target=Below(target,orbLow);
       }
-      double floor=atr*SCClamp(1.5+(trending?.5:choppy?-.3:0)+(f.adx>=35?.3:f.adx<15?-.2:0),.8,3);
-      return b.close+side*MathMax(side*(target-b.close),floor);
+      double minimum=atr*SCClamp(1.5+(trending?.5:choppy?-.3:0)+(f.adx>=35?.3:f.adx<15?-.2:0),.8,3);
+      return b.close+side*MathMax(side*(target-b.close),minimum);
    }
 
    void MakePlan(SCPath path,int side,bool allowed,SCSignal &plan)
@@ -1034,16 +1035,16 @@ public:
          && cfg.fvgMinPct>=0 && cfg.minRelVol>0 && cfg.minAtrPts>0 && cfg.qqqIncrement>0 && cfg.obMinMove>0;
    }
 
-   bool Process(const SCMarket &input,const int positionSide,SCSignal &out)
+   bool Process(const SCMarket &next,const int positionSide,SCSignal &out)
    {
       SCClearSignal(out);
-      if(!ValidConfig() || input.bar.time<=0 || (count>0 && input.bar.time<=market.bar.time)) return false;
-      if(!SCValid(input.bar.open) || !SCValid(input.bar.high) || !SCValid(input.bar.low) || !SCValid(input.bar.close)
-         || !SCValid(input.bar.volume) || input.bar.close<=0 || input.bar.open<=0 || input.bar.low<=0
-         || input.bar.high<MathMax(input.bar.open,input.bar.close) || input.bar.low>MathMin(input.bar.open,input.bar.close)
-         || input.bar.volume<=0 || !input.flow.valid || !SCValid(input.flow.buy) || !SCValid(input.flow.sell)
-         || input.flow.buy<0 || input.flow.sell<0 || input.flow.buy+input.flow.sell<=0) return false;
-      market=input; b=input.bar;
+      if(!ValidConfig() || next.bar.time<=0 || (count>0 && next.bar.time<=market.bar.time)) return false;
+      if(!SCValid(next.bar.open) || !SCValid(next.bar.high) || !SCValid(next.bar.low) || !SCValid(next.bar.close)
+         || !SCValid(next.bar.volume) || next.bar.close<=0 || next.bar.open<=0 || next.bar.low<=0
+         || next.bar.high<MathMax(next.bar.open,next.bar.close) || next.bar.low>MathMin(next.bar.open,next.bar.close)
+         || next.bar.volume<=0 || !next.flow.valid || !SCValid(next.flow.buy) || !SCValid(next.flow.sell)
+         || next.flow.buy<0 || next.flow.sell<0 || next.flow.buy+next.flow.sell<=0) return false;
+      market=next; b=next.bar;
       head=(head+1)%SC_HISTORY; marketHistory[head]=market; count=MathMin(count+1,SC_HISTORY); sequence++;
       ind.Push(b); f=ind.At(); p1=ind.At(1); p2=ind.At(2); p3=ind.At(3); p4=ind.At(4);
       b1=ind.Bar(1); b2=ind.Bar(2); b3=ind.Bar(3); b4=ind.Bar(4);

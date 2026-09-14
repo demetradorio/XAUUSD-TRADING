@@ -836,7 +836,7 @@ private:
             || (ulong)HistoryOrderGetInteger(m_lastOrderTicket,ORDER_MAGIC)!=m_cfg.magic) return;
          if(state!=ORDER_STATE_FILLED && state!=ORDER_STATE_CANCELED
             && state!=ORDER_STATE_REJECTED && state!=ORDER_STATE_EXPIRED) return;
-         PrintFormat("SuperScalper execution: pending order %I64u reached history state %d; no automatic retry was made.",m_lastOrderTicket,state);
+         PrintFormat("SuperScalper execution: pending order %I64u reached history state %d; no automatic retry was made.",m_lastOrderTicket,(int)state);
          m_pendingOutcome=false;
          m_pendingReported=false;
          if(!m_ambiguousOutcome) CompleteSend();
