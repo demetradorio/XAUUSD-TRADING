@@ -1,0 +1,15 @@
+{
+  "name": "xauusd-scalper-verification",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Local contract and experimental PineTS smoke tests; not TradingView backtesting",
+  "packageManager": "pnpm@10.26.0",
+  "scripts": {
+    "test": "pnpm run test:contracts && pnpm run test:pine",
+    "test:contracts": "python3 -m unittest discover -s tests -v",
+    "test:pine": "node tests/pine_smoke.cjs"
+  },
+  "devDependencies": {
+    "pinets": "0.9.33"
+  }
+}

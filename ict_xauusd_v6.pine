@@ -1,5 +1,5 @@
 //@version=6
-strategy("XAUUSD ICT 5 Tahap - Risk First v6", shorttitle = "ICT XAU v6", overlay = true,
+strategy("XAUUSD Active Scalper M5-M15 v6", shorttitle = "XAUScalp6", overlay = true,
      initial_capital = 10000, currency = currency.USD, pyramiding = 0,
      default_qty_type = strategy.fixed, margin_long = 5, margin_short = 5,
      commission_type = strategy.commission.percent, commission_value = 0.001,
@@ -7,95 +7,79 @@ strategy("XAUUSD ICT 5 Tahap - Risk First v6", shorttitle = "ICT XAU v6", overla
      process_orders_on_close = true, calc_on_order_fills = false, calc_on_every_tick = false,
      max_bars_back = 500)
 
-const string G_TIME = "01 | Waktu & berita UTC"
-const string G_SETUP = "02 | Sweep, MSS & FVG"
-const string G_ENTRY = "03 | OTE & pemicu"
-const string G_RISK = "04 | Risiko & eksekusi"
-const string G_FILTER = "05 | Filter kualitas"
-const string G_VIEW = "06 | Tampilan"
+const string G_SIGNAL = "01 | Scalper M5 / M15"
+const string G_TIME = "02 | Waktu & berita UTC"
+const string G_RISK = "03 | Risiko & exit"
+const string G_GUARD = "04 | Batas harian"
+const string G_VIEW = "05 | Tampilan"
 
-bool londonOn = input.bool(true, "London 07:00-10:00 GMT", group = G_TIME)
-bool newYorkOn = input.bool(true, "New York 12:00-15:00 GMT", group = G_TIME)
-bool overlapOn = input.bool(true, "Overlap 13:00-17:00 GMT", group = G_TIME)
+string setupMode = input.string("Pullback + Sweep", "Jenis setup", options = ["Pullback + Sweep", "Pullback", "Sweep"], group = G_SIGNAL)
+int fastLength = input.int(20, "EMA chart cepat", minval = 5, maxval = 199, group = G_SIGNAL)
+int slowLength = input.int(50, "EMA chart lambat", minval = 10, maxval = 500, group = G_SIGNAL)
+bool useBias = input.bool(true, "Filter bias HTF terkonfirmasi", group = G_SIGNAL)
+bool autoBias = input.bool(true, "HTF otomatis: M5 -> M15, M15 -> H1", group = G_SIGNAL)
+string manualBiasTf = input.timeframe("60", "HTF manual bila otomatis nonaktif", group = G_SIGNAL)
+int biasLength = input.int(50, "EMA bias HTF", minval = 10, maxval = 500, group = G_SIGNAL)
+bool useAdx = input.bool(true, "Filter ADX (hindari range lemah)", group = G_SIGNAL)
+float minAdx = input.float(18.0, "ADX minimum", minval = 10, maxval = 35, step = 1, group = G_SIGNAL)
+int atrLength = input.int(14, "ATR / DMI length", minval = 5, maxval = 100, group = G_SIGNAL)
+int sweepLookback = input.int(5, "Lookback sweep lokal (bar sebelumnya)", minval = 2, maxval = 20, group = G_SIGNAL)
+float minSweepPips = input.float(1.0, "Penetrasi minimum sweep (pip)", minval = 0.1, maxval = 10, group = G_SIGNAL)
+float touchAtr = input.float(0.20, "Toleransi sentuhan EMA x ATR", minval = 0, maxval = 0.5, step = 0.05, group = G_SIGNAL)
+float maxChaseAtr = input.float(0.75, "Jarak entry maksimum dari EMA x ATR", minval = 0.1, maxval = 1.5, step = 0.05, group = G_SIGNAL)
+float minBodyAtr = input.float(0.15, "Badan trigger minimum x ATR", minval = 0.05, maxval = 0.75, step = 0.05, group = G_SIGNAL)
+float maxRangeAtr = input.float(2.0, "Tolak candle spike > x ATR", minval = 1, maxval = 4, step = 0.25, group = G_SIGNAL)
+int setupLifeBars = input.int(3, "Masa berlaku setup (bar)", minval = 1, maxval = 10, group = G_SIGNAL)
+string entryMode = input.string("Market setelah trigger", "Eksekusi", options = ["Market setelah trigger", "Limit retest EMA"], group = G_SIGNAL)
+int limitLifeBars = input.int(2, "Masa berlaku limit (bar)", minval = 1, maxval = 5, group = G_SIGNAL)
+
+string sessionMode = input.string("London-NY 07:00-17:00", "Sesi GMT Senin-Jumat", group = G_TIME,
+     options = ["London-NY 07:00-17:00", "Killzone ICT 07-10 / 12-17"],
+     tooltip = "Scalper default memakai sesi kontinu, termasuk 10:00-12:00 GMT. Berita tetap diblokir.")
 bool calendarReviewed = input.bool(false, "Kalender high-impact sudah diperiksa", group = G_TIME,
-     tooltip = "Entri nonaktif sampai dicentang. Isi seluruh berita untuk periode uji/live. Pine tidak membaca kalender berita otomatis; daftar kosong berarti Anda mengonfirmasi tidak ada berita pada periode tersebut.")
+     tooltip = "Entri terkunci sampai kalender dan seluruh cakupannya diverifikasi. Pine tidak mengunduh kalender berita.")
 string newsSchedule = input.text_area("", "Berita UTC: satu YYYY-MM-DD HH:mm per baris", group = G_TIME,
-     tooltip = "Tanggal dan jam UTC/GMT, bukan jam lokal. Maksimum 500 acara. Blokir inklusif 15 menit sebelum/sesudah. Jadwal historis juga wajib untuk backtest yang memakai filter berita.")
+     tooltip = "Maksimum 500 acara. Blackout inklusif +/-15 menit. Isi jadwal historis lengkap untuk backtest.")
 int calendarStart = input.time(0, "Awal cakupan kalender terverifikasi (wajib diisi)", group = G_TIME)
-int calendarEnd = input.time(0, "Akhir cakupan kalender terverifikasi (wajib diisi)", group = G_TIME,
-     tooltip = "Entri terkunci di luar cakupan ini, termasuk setelah kalender kedaluwarsa. Jangan menyatakan cakupan yang belum diperiksa.")
+int calendarEnd = input.time(0, "Akhir cakupan kalender terverifikasi (wajib diisi)", group = G_TIME)
 int testStart = input.time(timestamp("01 Jan 2024 00:00 +0000"), "Mulai periode entri", group = G_TIME)
 int testEnd = input.time(timestamp("01 Jan 2035 00:00 +0000"), "Akhir periode entri", group = G_TIME)
 
-int swingLength = input.int(5, "Pivot likuiditas: kiri/kanan", minval = 2, maxval = 30, group = G_SETUP)
-int minorLength = input.int(2, "Pivot struktur minor: kiri/kanan", minval = 1, maxval = 10, group = G_SETUP)
-float equalPips = input.float(2.0, "Toleransi equal highs/lows (pip)", minval = 0, maxval = 10, group = G_SETUP)
-float minSweepPips = input.float(1.0, "Penetrasi minimum wick sweep (pip)", minval = 0.1, group = G_SETUP)
-int atrLength = input.int(14, "ATR", minval = 2, maxval = 500, group = G_SETUP)
-float displacementAtr = input.float(1.0, "Badan displacement minimum x ATR sebelumnya", minval = 0.5, step = 0.1, group = G_SETUP)
-float bodyFraction = input.float(0.65, "Badan minimum / rentang displacement", minval = 0.5, maxval = 0.95, step = 0.05, group = G_SETUP)
-float minFvgAtr = input.float(0.05, "Lebar FVG minimum x ATR sebelumnya", minval = 0.01, step = 0.01, group = G_SETUP)
-int mssWaitBars = input.int(10, "Batas bar sweep -> MSS", minval = 1, maxval = 50, group = G_SETUP)
-int obLookback = input.int(12, "Pencarian candle OB sebelum MSS", minval = 1, maxval = 50, group = G_SETUP)
-int pullbackWaitBars = input.int(30, "Batas bar FVG -> pullback", minval = 1, maxval = 100, group = G_SETUP)
-
-string entryMode = input.string("Market setelah rejection", "Eksekusi", group = G_ENTRY,
-     options = ["Market setelah rejection", "Limit 0.705", "Limit batas FVG / MT OB"])
-int triggerWaitBars = input.int(3, "Batas bar sentuhan -> rejection", minval = 0, maxval = 10, group = G_ENTRY)
-int limitLifeBars = input.int(3, "Masa berlaku limit (bar)", minval = 1, maxval = 10, group = G_ENTRY)
-float pinWickRatio = input.float(2.0, "Wick pin bar minimum / badan", minval = 1.5, step = 0.25, group = G_ENTRY)
-float maxChasePips = input.float(5.0, "Market: jarak maksimum dari zona (pip)", minval = 0, maxval = 20, group = G_ENTRY)
-
 float pipSize = input.float(0.10, "Ukuran 1 pip XAUUSD dalam harga", minval = 0.001, step = 0.01, group = G_RISK)
-float riskPercent = input.float(1.0, "Anggaran risiko ekuitas (%)", minval = 0.1, maxval = 1, step = 0.1, group = G_RISK)
-float stopBufferPips = input.float(2.0, "Buffer struktur SL (pip)", minval = 2, maxval = 3, step = 0.5, group = G_RISK)
-float maxStopPips = input.float(50.0, "Jarak SL maksimum (pip)", minval = 1, maxval = 50, group = G_RISK)
-float minTp1Pips = input.float(80.0, "Jarak TP1 minimum, tetap 2R (pip)", minval = 80, maxval = 100, step = 5, group = G_RISK)
+float riskPercent = input.float(0.5, "Anggaran risiko ekuitas (%)", minval = 0.1, maxval = 1, step = 0.1, group = G_RISK)
+float stopBufferPips = input.float(2.0, "Buffer di luar wick pullback/sweep (pip)", minval = 2, maxval = 3, step = 0.5, group = G_RISK)
+float minStopPips = input.float(10.0, "SL minimum (pip), bukan minimum TP1", minval = 5, maxval = 40, step = 1, group = G_RISK)
+float maxStopPips = input.float(50.0, "SL struktural maksimum (pip)", minval = 10, maxval = 50, step = 1, group = G_RISK)
+float tp1R = input.float(1.2, "TP1 dalam R", minval = 1.0, maxval = 2, step = 0.1, group = G_RISK)
+float tp2R = input.float(2.0, "TP2 dalam R (harus > TP1)", minval = 1.5, maxval = 4, step = 0.1, group = G_RISK)
 float partialPercent = input.float(70.0, "Porsi TP1 (%)", minval = 50, maxval = 80, step = 5, group = G_RISK)
-float minRunnerR = input.float(3.0, "RR minimum target likuiditas TP2", minval = 3, maxval = 5, step = 0.25, group = G_RISK)
-float bePips = input.float(45.0, "BEP: minimum profit saat close (pip), juga >= 1R", minval = 45, maxval = 50, group = G_RISK)
+float beAtR = input.float(1.0, "BEP saat profit close mencapai R", minval = 0.75, maxval = 1.5, step = 0.25, group = G_RISK)
+int maxHoldMinutes = input.int(60, "Time exit setelah maksimum menit", minval = 15, maxval = 240, step = 15, group = G_RISK)
+bool flatAtSessionEnd = input.bool(true, "Tutup sisa posisi di akhir sesi", group = G_RISK)
 float qtyStepOverride = input.float(0.0, "Step qty broker (0 = otomatis)", minval = 0, group = G_RISK,
-     tooltip = "Qty bukan selalu lot. Otomatis: setidaknya 1 oz dan syminfo.mincontract. Cocokkan spesifikasi simbol/broker.")
+     tooltip = "Qty bukan selalu lot. Otomatis minimal 1 oz dan syminfo.mincontract. Periksa kontrak broker.")
 int slippageTicks = input.int(2, "Estimasi slippage (tick) = Properties/Slippage", minval = 0, group = G_RISK)
 float commissionPercent = input.float(0.001, "Komisi per sisi (%) = Properties/Commission", minval = 0, step = 0.001, group = G_RISK,
-     tooltip = "Cadangan sizing; tidak mengubah Properties. Default Properties: komisi 0.001% per sisi dan slippage 2 tick. Keduanya harus disamakan jika diubah.")
+     tooltip = "Input hanya untuk cadangan sizing; tidak mengubah Properties. Default Properties 0.001% per sisi dan slippage 2 tick, bukan tarif broker yang terverifikasi.")
 
-bool useBias = input.bool(true, "Wajib searah bias HTF terkonfirmasi", group = G_FILTER)
-string biasTf = input.timeframe("15", "Timeframe bias (> timeframe chart)", group = G_FILTER)
-int fastLength = input.int(50, "EMA HTF cepat", minval = 2, maxval = 499, group = G_FILTER)
-int slowLength = input.int(200, "EMA HTF lambat", minval = 3, maxval = 500, group = G_FILTER)
-int targetPivotLength = input.int(3, "Pivot H1/H4 untuk TP2: kiri/kanan", minval = 1, maxval = 10, group = G_FILTER)
-int maxTradesDay = input.int(3, "Maksimum posisi baru per hari GMT", minval = 1, maxval = 20, group = G_FILTER)
-float dailyLossPercent = input.float(2.0, "Hentikan entri saat rugi terealisasi harian (%)", minval = 0.5, maxval = 10, step = 0.5, group = G_FILTER)
-int maxLosingStreak = input.int(2, "Hentikan entri setelah loss beruntun per hari", minval = 1, maxval = 10, group = G_FILTER)
-int cooldownBars = input.int(5, "Jeda bar setelah posisi selesai", minval = 1, maxval = 50, group = G_FILTER)
+int maxTradesDay = input.int(12, "Batas posisi baru per hari GMT (bukan target)", minval = 1, maxval = 30, group = G_GUARD)
+float dailyLossPercent = input.float(2.0, "Hentikan entry saat rugi terealisasi harian (%)", minval = 0.5, maxval = 5, step = 0.5, group = G_GUARD)
+int maxLosingStreak = input.int(3, "Batas loss beruntun per hari", minval = 1, maxval = 5, group = G_GUARD)
+int cooldownBars = input.int(1, "Cooldown setelah posisi selesai (bar)", minval = 1, maxval = 10, group = G_GUARD)
+bool showLevels = input.bool(true, "Plot EMA dan level posisi", group = G_VIEW)
+bool showSessions = input.bool(true, "Latar sesi / blackout berita", group = G_VIEW)
+bool showDashboard = input.bool(true, "Dashboard frekuensi dan hasil net", group = G_VIEW)
+int minimumSample = input.int(100, "Sampel minimum evaluasi WR", minval = 30, maxval = 1000, group = G_VIEW)
 
-bool showZones = input.bool(true, "Plot zona dan level", group = G_VIEW)
-bool showSessions = input.bool(true, "Latar killzone / blackout berita", group = G_VIEW)
-bool showDashboard = input.bool(true, "Dashboard posisi utuh, bukan exit parsial", group = G_VIEW)
-int minimumSample = input.int(100, "Sampel minimum untuk evaluasi WR", minval = 30, maxval = 1000, group = G_VIEW)
+string biasTf = autoBias ? (timeframe.multiplier == 5 ? "15" : "60") : manualBiasTf
 
-type Setup
-    int phase = 0
+type ScalpSetup
     int side = 0
-    int sweepBar = na
-    float sweep = na
-    float mss = na
-    int mssBar = na
-    float mssEnd = na
-    float obExtreme = na
-    float obMid = na
-    int fvgBar = na
-    float fvgLow = na
-    float fvgHigh = na
-    float oteLow = na
-    float oteHigh = na
-    float sweet = na
-    float equilibrium = na
-    float zoneLow = na
-    float zoneHigh = na
-    float limitEdge = na
-    int touchBar = na
+    int startBar = na
+    float extreme = na
+    float reference = na
+    float chaseBoundary = na
+    string kind = ""
 
 type TradePlan
     bool active = false
@@ -109,7 +93,6 @@ type TradePlan
     float entry = na
     float initialStop = na
     float invalidation = na
-    float equilibrium = na
     float chaseBoundary = na
     float risk = na
     float tp1 = na
@@ -150,11 +133,13 @@ f_parseNews(string schedule) =>
     array.sort(events, order.ascending)
     events
 
-f_killzone(int stamp) =>
+f_session(int stamp) =>
     int weekday = dayofweek(stamp, "GMT+0")
     int minuteOfDay = hour(stamp, "GMT+0") * 60 + minute(stamp, "GMT+0")
     bool workingDay = weekday >= dayofweek.monday and weekday <= dayofweek.friday
-    workingDay and ((londonOn and minuteOfDay >= 420 and minuteOfDay < 600) or (newYorkOn and minuteOfDay >= 720 and minuteOfDay < 900) or (overlapOn and minuteOfDay >= 780 and minuteOfDay < 1020))
+    bool continuous = minuteOfDay >= 420 and minuteOfDay < 1020
+    bool ict = (minuteOfDay >= 420 and minuteOfDay < 600) or (minuteOfDay >= 720 and minuteOfDay < 1020)
+    workingDay and (sessionMode == "London-NY 07:00-17:00" ? continuous : ict)
 
 f_newsBlocked(array<int> events, int startTime, int endTime) =>
     int left = 0
@@ -173,13 +158,7 @@ f_newsBlocked(array<int> events, int startTime, int endTime) =>
     blocked
 
 f_windowAllowed(array<int> events, int startTime, int endTime) =>
-    calendarReviewed and startTime >= calendarStart and endTime <= calendarEnd and startTime >= testStart and endTime <= testEnd and f_killzone(startTime) and f_killzone(endTime) and not f_newsBlocked(events, startTime, endTime)
-
-f_inside(float price, float zoneLow, float zoneHigh) =>
-    not na(price) and price >= zoneLow and price <= zoneHigh
-
-f_roundPrice(float price) =>
-    math.round_to_mintick(price)
+    calendarReviewed and startTime >= calendarStart and endTime <= calendarEnd and startTime >= testStart and endTime <= testEnd and f_session(startTime) and f_session(endTime) and not f_newsBlocked(events, startTime, endTime)
 
 f_structuralStop(int side, float extreme) =>
     float rawStop = extreme - side * stopBufferPips * pipSize
@@ -189,33 +168,6 @@ f_riskPerUnit(float entry, float stop) =>
     float stopLoss = math.abs(entry - stop) + slippageTicks * syminfo.mintick
     float fees = (math.abs(entry) + math.abs(stop)) * commissionPercent / 100
     (stopLoss + fees) * syminfo.pointvalue
-
-f_prunePool(array<float> pool, int side) =>
-    if array.size(pool) > 0
-        for i = array.size(pool) - 1 to 0
-            if (side == 1 and high >= array.get(pool, i)) or (side == -1 and low <= array.get(pool, i))
-                array.remove(pool, i)
-
-f_addPool(array<float> pool, float level, int side) =>
-    bool untouched = not na(level) and (side == 1 ? high < level : low > level)
-    if untouched and not array.includes(pool, level)
-        array.push(pool, level)
-        if array.size(pool) > 64
-            array.shift(pool)
-
-f_target(array<float> pool, int side, float entry, float risk) =>
-    float selected = na
-    if risk > 0 and array.size(pool) > 0
-        for level in pool
-            float reward = side * (level - entry)
-            if reward >= minRunnerR * risk - syminfo.mintick * 0.001 and (na(selected) or reward < side * (selected - entry))
-                selected := level
-    selected
-
-f_confirmedPivots(int length) =>
-    float ph = ta.pivothigh(high, length, length)
-    float pl = ta.pivotlow(low, length, length)
-    [ph[1], pl[1]]
 
 f_wilsonLower(int wins, int count) =>
     float n = count
@@ -230,30 +182,22 @@ f_row(table panel, int row, string title, string value, color tone) =>
     table.cell(panel, 1, row, value, text_color = tone, text_size = size.small)
 
 if barstate.isfirst
-    if not timeframe.isminutes or (timeframe.multiplier != 1 and timeframe.multiplier != 5)
-        runtime.error("Gunakan chart M1 atau M5 untuk pemicu eksekusi.")
+    if not timeframe.isminutes or (timeframe.multiplier != 5 and timeframe.multiplier != 15)
+        runtime.error("Active Scalper: gunakan candle standar M5 atau M15. Versi ICT lama ada di strategies/ict_strict_v6.pine.")
     if not chart.is_standard
-        runtime.error("Gunakan candle/bar standar; bukan Heikin Ashi, Renko, atau chart sintetis.")
-    if timeframe.in_seconds(biasTf) <= timeframe.in_seconds()
-        runtime.error("Timeframe bias harus lebih tinggi daripada chart.")
-    if slowLength <= fastLength or testEnd <= testStart
-        runtime.error("EMA lambat harus > EMA cepat dan akhir periode harus > awal.")
-    if calendarReviewed and calendarEnd <= calendarStart
-        runtime.error("Isi awal/akhir cakupan kalender yang sudah diperiksa sebelum mengaktifkan entri.")
+        runtime.error("Gunakan candle/bar standar, bukan Heikin Ashi, Renko, atau chart sintetis.")
+    if useBias and timeframe.in_seconds(biasTf) <= timeframe.in_seconds()
+        runtime.error("HTF bias harus lebih tinggi daripada chart; aktifkan HTF otomatis.")
+    if slowLength <= fastLength or minStopPips > maxStopPips or tp2R <= tp1R
+        runtime.error("EMA lambat harus > EMA cepat, SL minimum <= maksimum, TP2 R > TP1 R.")
+    if testEnd <= testStart or (calendarReviewed and calendarEnd <= calendarStart)
+        runtime.error("Isi awal/akhir periode dan cakupan kalender yang valid sebelum mengaktifkan entry.")
     if syminfo.currency != "USD" or syminfo.pointvalue <= 0 or pipSize < syminfo.mintick
-        runtime.error("Strategi khusus instrumen berkuotasi USD. Periksa pointvalue dan ukuran pip terhadap tick simbol.")
+        runtime.error("Pilih XAUUSD berkuotasi USD; periksa pointvalue, pip, dan tick simbol.")
 
 var array<int> newsEvents = f_parseNews(newsSchedule)
-var array<float> buyTargets = array.new_float()
-var array<float> sellTargets = array.new_float()
-var Setup setup = Setup.new()
+var ScalpSetup setup = ScalpSetup.new()
 var TradePlan trade = TradePlan.new()
-var float lastHigh = na
-var float previousHigh = na
-var float lastLow = na
-var float previousLow = na
-var float lastMinorHigh = na
-var float lastMinorLow = na
 var int utcDay = na
 var float dayStartNet = 0
 var float dayStartEquity = 10000
@@ -266,22 +210,44 @@ var int winners = 0
 var int losers = 0
 var float winningPnl = 0
 var float losingPnl = 0
-var string lastStatus = "Aktifkan kalender setelah verifikasi berita."
+var int eligibleDays = 0
+var int lastEligibleDay = na
+var int totalFills = 0
+var int setupCount = 0
+var int triggerCount = 0
+var int orderCount = 0
+var int riskRejected = 0
+var int sizingRejected = 0
+var int executionRejected = 0
+var int cancelledOrders = 0
+var string lastStatus = "Verifikasi kalender; mulai dari M5 dan biaya broker yang sesuai."
 
 float atr = ta.atr(atrLength)
-float majorHigh = ta.pivothigh(high, swingLength, swingLength)
-float majorLow = ta.pivotlow(low, swingLength, swingLength)
-float minorHigh = ta.pivothigh(high, minorLength, minorLength)
-float minorLow = ta.pivotlow(low, minorLength, minorLength)
-// Offset satu bar HTF: hanya data yang sudah ditutup, tanpa bocoran masa depan.
-[biasClose, biasFast, biasSlow] = request.security(syminfo.tickerid, biasTf,
-     [close[1], ta.ema(close, fastLength)[1], ta.ema(close, slowLength)[1]], lookahead = barmerge.lookahead_on)
-[h1High, h1Low] = request.security(syminfo.tickerid, "60", f_confirmedPivots(targetPivotLength), lookahead = barmerge.lookahead_on)
-[h4High, h4Low] = request.security(syminfo.tickerid, "240", f_confirmedPivots(targetPivotLength), lookahead = barmerge.lookahead_on)
-bool newH1 = timeframe.change("60")
-bool newH4 = timeframe.change("240")
-bool buyBias = not useBias or (biasClose > biasFast and biasFast > biasSlow)
-bool sellBias = not useBias or (biasClose < biasFast and biasFast < biasSlow)
+float emaFast = ta.ema(close, fastLength)
+float emaSlow = ta.ema(close, slowLength)
+[diPlus, diMinus, adx] = ta.dmi(atrLength, atrLength)
+float previousLow = ta.lowest(low, sweepLookback)[1]
+float previousHigh = ta.highest(high, sweepLookback)[1]
+// Bias dan zona entry memakai level yang sudah diketahui sebelum candle trigger.
+[biasClose, biasEma] = request.security(syminfo.tickerid, biasTf,
+     [close[1], ta.ema(close, biasLength)[1]], lookahead = barmerge.lookahead_on)
+bool buyBias = emaFast[1] > emaSlow[1] and (not useBias or biasClose > biasEma)
+bool sellBias = emaFast[1] < emaSlow[1] and (not useBias or biasClose < biasEma)
+bool qualityOk = not useAdx or adx >= minAdx
+bool readyHistory = bar_index >= slowLength and not na(atr[1]) and (not useBias or not na(biasEma))
+float bandLow = emaFast[1] - touchAtr * atr[1]
+float bandHigh = emaFast[1] + touchAtr * atr[1]
+bool touchesBand = low <= bandHigh and high >= bandLow
+bool buyPullback = touchesBand and close > emaSlow[1]
+bool sellPullback = touchesBand and close < emaSlow[1]
+bool buySweep = low < previousLow - minSweepPips * pipSize and close > previousLow
+bool sellSweep = high > previousHigh + minSweepPips * pipSize and close < previousHigh
+bool newBuyPullback = buyPullback and not buyPullback[1]
+bool newSellPullback = sellPullback and not sellPullback[1]
+bool newBuySweep = buySweep and not buySweep[1]
+bool newSellSweep = sellSweep and not sellSweep[1]
+bool buyEvent = (setupMode != "Sweep" and newBuyPullback) or (setupMode != "Pullback" and newBuySweep)
+bool sellEvent = (setupMode != "Sweep" and newSellPullback) or (setupMode != "Pullback" and newSellSweep)
 bool currentWindow = f_windowAllowed(newsEvents, time, time_close)
 int nextClose = time_close + int(timeframe.in_seconds() * 1000)
 bool nextWindow = f_windowAllowed(newsEvents, time_close, nextClose)
@@ -293,10 +259,9 @@ float body = math.abs(close - open)
 float candleRange = high - low
 float lowerWick = math.min(open, close) - low
 float upperWick = high - math.max(open, close)
-bool buySweepMark = false
-bool sellSweepMark = false
-bool buyMssMark = false
-bool sellMssMark = false
+bool spike = candleRange > maxRangeAtr * atr[1]
+bool buySetupMark = false
+bool sellSetupMark = false
 bool buyOrderMark = false
 bool sellOrderMark = false
 
@@ -308,27 +273,9 @@ if barstate.isconfirmed
         dayStartEquity := math.max(strategy.initial_capital + dayStartNet, 0)
         dailyEntries := 0
         losingStreak := 0
-
-    f_prunePool(buyTargets, 1)
-    f_prunePool(sellTargets, -1)
-    if not na(majorHigh)
-        previousHigh := lastHigh
-        lastHigh := majorHigh
-        f_addPool(buyTargets, majorHigh, 1)
-    if not na(majorLow)
-        previousLow := lastLow
-        lastLow := majorLow
-        f_addPool(sellTargets, majorLow, -1)
-    if not na(minorHigh)
-        lastMinorHigh := minorHigh
-    if not na(minorLow)
-        lastMinorLow := minorLow
-    if newH1
-        f_addPool(buyTargets, h1High, 1)
-        f_addPool(sellTargets, h1Low, -1)
-    if newH4
-        f_addPool(buyTargets, h4High, 1)
-        f_addPool(sellTargets, h4Low, -1)
+    if currentWindow and (na(lastEligibleDay) or dayKey != lastEligibleDay)
+        eligibleDays += 1
+        lastEligibleDay := dayKey
 
     bool newClosedLegs = strategy.closedtrades > closedSeen
     if trade.active
@@ -336,13 +283,14 @@ if barstate.isconfirmed
         if firstObservedFill
             trade.filled := true
             dailyEntries += 1
+            totalFills += 1
         if newClosedLegs
             for i = closedSeen to strategy.closedtrades - 1
                 string exitId = strategy.closedtrades.exit_id(i)
                 if exitId == "L-TP1" or exitId == "S-TP1"
                     trade.firstLegClosed := true
         if trade.filled and strategy.position_size == 0
-            // Hitung satu entry sampai flat, bukan dua kemenangan dari exit parsial.
+            // Satu entry sampai flat, net setelah biaya; parsial bukan kemenangan tambahan.
             float netResult = strategy.netprofit - trade.netAtStart
             completed += 1
             if netResult > 0
@@ -361,177 +309,99 @@ if barstate.isconfirmed
             if firstObservedFill
                 trade.entry := strategy.position_avg_price
                 trade.risk := trade.side * (trade.entry - trade.initialStop)
-                trade.tp1 := f_roundPrice(trade.entry + trade.side * 2 * trade.risk)
-            bool fillRiskOk = trade.risk > 0 and trade.risk <= maxStopPips * pipSize + syminfo.mintick * 0.001 and 2 * trade.risk >= minTp1Pips * pipSize - syminfo.mintick * 0.001
-            bool fillTargetOk = trade.risk > 0 and trade.side * (trade.tp2 - trade.entry) >= minRunnerR * trade.risk - syminfo.mintick * 0.001
+                trade.tp1 := math.round_to_mintick(trade.entry + trade.side * tp1R * trade.risk)
+                trade.tp2 := math.round_to_mintick(trade.entry + trade.side * tp2R * trade.risk)
+            bool fillRiskOk = trade.risk >= minStopPips * pipSize - syminfo.mintick * 0.001 and trade.risk <= maxStopPips * pipSize + syminfo.mintick * 0.001
             bool fillBudgetOk = f_riskPerUnit(trade.entry, trade.initialStop) * trade.qty <= trade.riskBudget + 0.01
             int filledAt = strategy.opentrades.entry_time(0)
             bool fillTimeOk = f_windowAllowed(newsEvents, filledAt, filledAt)
-            bool fillHalfOk = trade.side == 1 ? trade.entry < trade.equilibrium : trade.entry > trade.equilibrium
             bool fillChaseOk = not trade.market or (trade.side == 1 ? trade.entry <= trade.chaseBoundary : trade.entry >= trade.chaseBoundary)
             bool unexpectedReduction = not trade.firstLegClosed and math.abs(strategy.position_size) < trade.qty - qtyStep * 0.1
-            if trade.closing or not fillRiskOk or not fillTargetOk or not fillBudgetOk or not fillTimeOk or not fillHalfOk or not fillChaseOk or unexpectedReduction
+            bool timeExit = time_close - filledAt >= maxHoldMinutes * 60 * 1000
+            bool sessionExit = flatAtSessionEnd and not f_session(time_close)
+            bool riskExit = not fillRiskOk or not fillBudgetOk or not fillTimeOk or not fillChaseOk or unexpectedReduction
+            if trade.closing or riskExit or timeExit or sessionExit
                 trade.closing := true
                 strategy.cancel_all()
-                strategy.close_all(comment = "Fill di luar batas risiko", alert_message = "RISK_GUARD: fill berbeda dari rencana; tutup posisi.", immediately = true)
-                lastStatus := "Proteksi fill: tutup karena gap/slippage/batas risiko."
-            // Tidak memakai high/low bar fill untuk mengklaim BEP intrabar retroaktif.
-            else if trade.side * (close - trade.entry) >= math.max(bePips * pipSize, trade.risk)
+                string reason = riskExit ? "Fill risk guard" : timeExit ? "Time exit" : "Session exit"
+                strategy.close_all(comment = reason, alert_message = reason + ": tutup sisa posisi", immediately = true)
+                lastStatus := reason
+            else if trade.side * (close - trade.entry) >= beAtR * trade.risk
                 trade.breakEven := true
 
     closedSeen := strategy.closedtrades
     float dayPnl = strategy.netprofit - dayStartNet
     bool dailyAllowed = dayStartEquity > 0 and dayPnl > -dayStartEquity * dailyLossPercent / 100 and dailyEntries < maxTradesDay and losingStreak < maxLosingStreak
     bool cooldownReady = na(lastExitBar) or bar_index - lastExitBar >= cooldownBars
-    bool canPrepare = currentWindow and dailyAllowed and cooldownReady and not na(atr[1]) and strategy.equity > 0
+    bool canPrepare = currentWindow and dailyAllowed and cooldownReady and readyHistory and strategy.equity > 0
 
     if trade.active and not trade.filled and strategy.position_size == 0
         bool staleOrder = bar_index - trade.sentBar >= limitLifeBars
         bool invalidated = trade.side == 1 ? low <= trade.invalidation : high >= trade.invalidation
-        bool targetAlreadyHit = trade.side == 1 ? high >= trade.tp2 : low <= trade.tp2
         bool biasLost = trade.side == 1 ? not buyBias : not sellBias
-        if staleOrder or not nextWindow or not dailyAllowed or invalidated or targetAlreadyHit or biasLost
+        if staleOrder or not nextWindow or not dailyAllowed or invalidated or biasLost
             strategy.cancel_all()
             trade := TradePlan.new()
-            lastStatus := "Order belum terisi dibatalkan: waktu/berita/struktur/TTL."
+            cancelledOrders += 1
+            lastStatus := "Pending dibatalkan: TTL/waktu/berita/struktur/bias."
 
     if not trade.active and strategy.position_size == 0
-        bool invalidSetup = setup.phase > 0 and ((setup.side == 1 ? low <= setup.sweep : high >= setup.sweep) or (setup.side == 1 ? not buyBias : not sellBias))
-        if not canPrepare
-            setup := Setup.new()
-        else if invalidSetup
-            setup := Setup.new()
-            lastStatus := "Setup batal: sweep ditembus ulang atau bias berubah."
+        if not canPrepare or not qualityOk or spike or (buySweep and sellSweep)
+            setup := ScalpSetup.new()
         else
-            switch setup.phase
-                0 =>
-                    bool equalHighs = not na(previousHigh) and math.abs(lastHigh - previousHigh) <= equalPips * pipSize
-                    bool equalLows = not na(previousLow) and math.abs(lastLow - previousLow) <= equalPips * pipSize
-                    float bsl = equalHighs ? math.max(lastHigh, previousHigh) : lastHigh
-                    float ssl = equalLows ? math.min(lastLow, previousLow) : lastLow
-                    bool buySweep = not na(ssl) and not na(lastMinorHigh) and low <= ssl - minSweepPips * pipSize and math.min(open, close) >= ssl and close > ssl and close < lastMinorHigh
-                    bool sellSweep = not na(bsl) and not na(lastMinorLow) and high >= bsl + minSweepPips * pipSize and math.max(open, close) <= bsl and close < bsl and close > lastMinorLow
-                    if buySweep != sellSweep and ((buySweep and buyBias) or (sellSweep and sellBias))
-                        setup.side := buySweep ? 1 : -1
-                        setup.phase := 1
-                        setup.sweepBar := bar_index
-                        setup.sweep := buySweep ? low : high
-                        setup.mss := buySweep ? lastMinorHigh : lastMinorLow
-                        buySweepMark := buySweep
-                        sellSweepMark := sellSweep
-                        lastStatus := "2/5 Sweep valid; menunggu displacement MSS."
-                1 =>
-                    bool structureClosed = setup.side == 1 ? close > setup.mss : close < setup.mss
-                    bool directional = setup.side == 1 ? close > open : close < open
-                    bool strongClose = candleRange > 0 and (setup.side == 1 ? (close - low) / candleRange >= 0.75 : (high - close) / candleRange >= 0.75)
-                    bool displacement = directional and candleRange > 0 and body >= displacementAtr * atr[1] and body / candleRange >= bodyFraction and strongClose
-                    if bar_index - setup.sweepBar > mssWaitBars
-                        setup := Setup.new()
-                        lastStatus := "Setup kedaluwarsa sebelum MSS."
-                    else if structureClosed
-                        if displacement
-                            setup.phase := 2
-                            setup.mssBar := bar_index
-                            setup.mssEnd := setup.side == 1 ? high : low
-                            for i = 1 to obLookback
-                                if bar_index - i < setup.sweepBar
-                                    break
-                                if setup.side == 1 ? close[i] < open[i] : close[i] > open[i]
-                                    setup.obMid := (open[i] + close[i]) / 2
-                                    setup.obExtreme := setup.side == 1 ? low[i] : high[i]
-                                    break
-                            buyMssMark := setup.side == 1
-                            sellMssMark := setup.side == -1
-                            lastStatus := "MSS close valid; wajib FVG pada bar berikutnya."
-                        else
-                            setup := Setup.new()
-                            lastStatus := "Batal: break struktur tanpa displacement."
-                2 =>
-                    bool isBuy = setup.side == 1
-                    float gapLow = isBuy ? high[2] : high
-                    float gapHigh = isBuy ? low : low[2]
-                    bool gapValid = bar_index == setup.mssBar + 1 and gapHigh - gapLow >= math.max(syminfo.mintick, atr[1] * minFvgAtr) and (isBuy ? close[1] > high[2] : close[1] < low[2])
-                    if gapValid
-                        float rangeEnd = isBuy ? math.max(setup.mssEnd, high) : math.min(setup.mssEnd, low)
-                        float dealingRange = math.abs(rangeEnd - setup.sweep)
-                        setup.fvgLow := gapLow
-                        setup.fvgHigh := gapHigh
-                        setup.fvgBar := bar_index
-                        setup.oteLow := isBuy ? rangeEnd - 0.786 * dealingRange : rangeEnd + 0.618 * dealingRange
-                        setup.oteHigh := isBuy ? rangeEnd - 0.618 * dealingRange : rangeEnd + 0.786 * dealingRange
-                        setup.sweet := rangeEnd - setup.side * 0.705 * dealingRange
-                        setup.equilibrium := (rangeEnd + setup.sweep) / 2
-                        bool lowEdgeInside = f_inside(gapLow, setup.oteLow, setup.oteHigh)
-                        bool highEdgeInside = f_inside(gapHigh, setup.oteLow, setup.oteHigh)
-                        bool fvgConfluence = lowEdgeInside or highEdgeInside
-                        bool obConfluence = f_inside(setup.obMid, setup.oteLow, setup.oteHigh)
-                        if dealingRange > 0 and (fvgConfluence or obConfluence)
-                            setup.phase := 3
-                            float fvgZoneLow = math.max(gapLow, setup.oteLow)
-                            float fvgZoneHigh = math.min(gapHigh, setup.oteHigh)
-                            float fvgDistance = math.max(fvgZoneLow - setup.sweet, setup.sweet - fvgZoneHigh, 0)
-                            bool chooseFvg = fvgConfluence and (not obConfluence or fvgDistance <= math.abs(setup.obMid - setup.sweet))
-                            if chooseFvg
-                                setup.zoneLow := fvgZoneLow
-                                setup.zoneHigh := fvgZoneHigh
-                                setup.limitEdge := lowEdgeInside and highEdgeInside ? (math.abs(gapLow - setup.sweet) <= math.abs(gapHigh - setup.sweet) ? gapLow : gapHigh) : (lowEdgeInside ? gapLow : gapHigh)
-                            else
-                                // Midpoint badan OB bisa berada di antara dua tick.
-                                setup.zoneLow := math.max(setup.oteLow, setup.obMid - syminfo.mintick / 2)
-                                setup.zoneHigh := math.min(setup.oteHigh, setup.obMid + syminfo.mintick / 2)
-                                setup.limitEdge := setup.obMid
-                            lastStatus := chooseFvg ? "3/5 MSS + FVG; tunggu OTE/FVG." : "3/5 MSS + FVG; tunggu OTE/MT OB."
-                        else
-                            setup := Setup.new()
-                            lastStatus := "Batal: tidak ada konfluensi OTE dengan batas FVG/MT OB."
-                    else
-                        setup := Setup.new()
-                        lastStatus := "Batal: displacement tidak meninggalkan FVG."
-                3 =>
-                    bool tooDeep = setup.side == 1 ? close < setup.oteLow : close > setup.oteHigh
-                    if bar_index - setup.fvgBar > pullbackWaitBars or tooDeep
-                        setup := Setup.new()
-                        lastStatus := "Pullback kedaluwarsa atau close melewati OTE 78.6%."
-                    else if low <= setup.zoneHigh and high >= setup.zoneLow
-                        setup.phase := 4
-                        setup.touchBar := bar_index
-                        lastStatus := "4/5 Konfluensi tersentuh; tunggu rejection."
-                4 =>
-                    bool tooDeep = setup.side == 1 ? close < setup.oteLow : close > setup.oteHigh
-                    if bar_index - setup.touchBar > triggerWaitBars or tooDeep
-                        setup := Setup.new()
-                        lastStatus := "Batal: tidak ada rejection tepat waktu."
-
-            if setup.phase == 4
+            bool resetThisBar = false
+            if setup.side != 0
+                bool staleSetup = bar_index - setup.startBar > setupLifeBars
+                bool wrongTrend = setup.side == 1 ? not buyBias or close < emaSlow[1] : not sellBias or close > emaSlow[1]
+                if staleSetup or wrongTrend
+                    setup := ScalpSetup.new()
+                    resetThisBar := true
+                    lastStatus := "Setup kedaluwarsa / kehilangan trend."
+                else
+                    setup.extreme := setup.side == 1 ? math.min(setup.extreme, low) : math.max(setup.extreme, high)
+            if setup.side == 0 and not resetThisBar
+                bool armBuy = buyEvent and buyBias
+                bool armSell = sellEvent and sellBias
+                if armBuy != armSell
+                    setup.side := armBuy ? 1 : -1
+                    setup.startBar := bar_index
+                    setup.extreme := armBuy ? low : high
+                    setup.reference := emaFast[1]
+                    setup.chaseBoundary := setup.reference + setup.side * maxChaseAtr * atr[1]
+                    setup.kind := (setupMode != "Pullback" and (armBuy ? newBuySweep : newSellSweep)) ? "Sweep reclaim" : "EMA pullback"
+                    setupCount += 1
+                    buySetupMark := armBuy
+                    sellSetupMark := armSell
+                    lastStatus := setup.kind + ": tunggu trigger searah."
+            if setup.side != 0
                 bool isBuy = setup.side == 1
-                bool touchesZone = low <= setup.zoneHigh and high >= setup.zoneLow
-                bool pin = body >= syminfo.mintick and (isBuy ? close > open and lowerWick >= pinWickRatio * body and lowerWick >= 0.5 * candleRange and upperWick <= body : close < open and upperWick >= pinWickRatio * body and upperWick >= 0.5 * candleRange and lowerWick <= body)
-                bool engulfing = body >= 0.2 * atr[1] and (isBuy ? close[1] < open[1] and close > open and open <= close[1] and close >= open[1] : close[1] > open[1] and close < open and open >= close[1] and close <= open[1])
-                bool reclaimed = isBuy ? close >= setup.zoneHigh : close <= setup.zoneLow
-                if touchesZone and reclaimed and (pin or engulfing)
-                    bool marketOrder = entryMode == "Market setelah rejection"
-                    float rawEntry = marketOrder ? close + setup.side * slippageTicks * syminfo.mintick : (entryMode == "Limit 0.705" ? setup.sweet : setup.limitEdge)
-                    float entry = f_roundPrice(rawEntry)
-                    float invalidation = na(setup.obExtreme) ? setup.sweep : (isBuy ? math.min(setup.sweep, setup.obExtreme) : math.max(setup.sweep, setup.obExtreme))
-                    float stop = f_structuralStop(setup.side, invalidation)
+                bool directional = isBuy ? close > open : close < open
+                bool reclaimed = isBuy ? close > setup.reference : close < setup.reference
+                bool rejection = candleRange > 0 and (isBuy ? lowerWick >= body and (close - low) / candleRange >= 0.6 : upperWick >= body and (high - close) / candleRange >= 0.6)
+                bool engulfing = isBuy ? close[1] < open[1] and open <= close[1] and close >= open[1] : close[1] > open[1] and open >= close[1] and close <= open[1]
+                bool minorBreak = isBuy ? close > high[1] : close < low[1]
+                bool trigger = directional and reclaimed and body >= minBodyAtr * atr[1] and (rejection or engulfing or minorBreak)
+                if trigger
+                    triggerCount += 1
+                    bool marketOrder = entryMode == "Market setelah trigger"
+                    float entry = math.round_to_mintick(marketOrder ? close + setup.side * slippageTicks * syminfo.mintick : setup.reference)
+                    float stop = f_structuralStop(setup.side, setup.extreme)
                     float risk = setup.side * (entry - stop)
-                    float target = f_target(isBuy ? buyTargets : sellTargets, setup.side, entry, risk)
-                    float budget = strategy.equity * riskPercent / 100
+                    float remainingDailyRisk = math.max(dayStartEquity * dailyLossPercent / 100 + dayPnl, 0)
+                    float budget = math.min(strategy.equity * riskPercent / 100, remainingDailyRisk)
                     float perUnit = f_riskPerUnit(entry, stop)
                     float riskQty = perUnit > 0 ? math.floor(budget / perUnit / qtyStep) * qtyStep : 0
-                    // Margin deklarasi 5%; sisakan 10% daya beli, jangan menaikkan risiko.
+                    // Margin model 5%; cadangkan 10% daya beli, tanpa menaikkan risiko.
                     float affordableQty = entry > 0 ? math.floor(strategy.equity * 0.9 / (entry * syminfo.pointvalue * 0.05) / qtyStep) * qtyStep : 0
                     float qty = math.min(riskQty, affordableQty)
                     float firstQty = math.floor(qty * partialPercent / 100 / qtyStep + 1e-9) * qtyStep
                     float runnerQty = qty - firstQty
+                    bool riskOk = risk >= minStopPips * pipSize - syminfo.mintick * 0.001 and risk <= maxStopPips * pipSize + syminfo.mintick * 0.001
                     bool sizingOk = qty > 0 and firstQty >= qtyStep and runnerQty >= qtyStep - 1e-9 and firstQty / qty >= 0.5 - 1e-9 and firstQty / qty <= 0.8 + 1e-9
-                    bool stopOk = risk > 0 and risk <= maxStopPips * pipSize + syminfo.mintick * 0.001
-                    bool tp1Ok = 2 * risk >= minTp1Pips * pipSize - syminfo.mintick * 0.001
-                    bool correctHalf = isBuy ? entry < setup.equilibrium : entry > setup.equilibrium
-                    bool notChasing = isBuy ? entry <= setup.zoneHigh + maxChasePips * pipSize : entry >= setup.zoneLow - maxChasePips * pipSize
+                    bool notChasing = isBuy ? entry <= setup.chaseBoundary : entry >= setup.chaseBoundary
                     bool passiveLimit = isBuy ? entry < close : entry > close
-                    bool executionOk = marketOrder ? notChasing : passiveLimit and f_inside(entry, setup.zoneLow, setup.zoneHigh) and nextWindow
-                    if stopOk and tp1Ok and not na(target) and sizingOk and correctHalf and executionOk
+                    bool executionOk = notChasing and (marketOrder or (passiveLimit and nextWindow))
+                    if riskOk and sizingOk and executionOk
                         trade := TradePlan.new()
                         trade.active := true
                         trade.market := marketOrder
@@ -539,83 +409,92 @@ if barstate.isconfirmed
                         trade.sentBar := bar_index
                         trade.entry := entry
                         trade.initialStop := stop
-                        trade.invalidation := invalidation
-                        trade.equilibrium := setup.equilibrium
-                        trade.chaseBoundary := isBuy ? setup.zoneHigh + maxChasePips * pipSize : setup.zoneLow - maxChasePips * pipSize
+                        trade.invalidation := setup.extreme
+                        trade.chaseBoundary := setup.chaseBoundary
                         trade.risk := risk
-                        trade.tp1 := f_roundPrice(entry + setup.side * 2 * risk)
-                        trade.tp2 := target
+                        trade.tp1 := math.round_to_mintick(entry + setup.side * tp1R * risk)
+                        trade.tp2 := math.round_to_mintick(entry + setup.side * tp2R * risk)
                         trade.qty := qty
                         trade.firstQty := firstQty
                         trade.runnerQty := runnerQty
                         trade.riskBudget := budget
                         trade.netAtStart := strategy.netprofit
-                        string message = (isBuy ? "BUY" : "SELL") + " | " + syminfo.tickerid + " | qty=" + str.tostring(qty) + " | plan=" + f_price(entry) + " | SL=" + f_price(stop) + " | TP1=" + f_price(trade.tp1) + " | TP2=" + f_price(target)
+                        string message = (isBuy ? "BUY" : "SELL") + " | " + syminfo.tickerid + " | " + setup.kind + " | qty=" + str.tostring(qty) + " | plan=" + f_price(entry) + " | SL=" + f_price(stop) + " | TP1=" + f_price(trade.tp1) + " | TP2=" + f_price(trade.tp2)
                         if isBuy
-                            strategy.entry("L", strategy.long, qty = qty, limit = marketOrder ? na : entry, alert_message = message)
+                            if marketOrder
+                                strategy.entry("L", strategy.long, qty = qty, alert_message = message)
+                            else
+                                strategy.entry("L", strategy.long, qty = qty, limit = entry, alert_message = message)
                             buyOrderMark := true
                         else
-                            strategy.entry("S", strategy.short, qty = qty, limit = marketOrder ? na : entry, alert_message = message)
+                            if marketOrder
+                                strategy.entry("S", strategy.short, qty = qty, alert_message = message)
+                            else
+                                strategy.entry("S", strategy.short, qty = qty, limit = entry, alert_message = message)
                             sellOrderMark := true
-                        lastStatus := "5/5 Rejection valid; " + (marketOrder ? "market dikirim." : "limit menunggu retest baru.")
+                        orderCount += 1
+                        lastStatus := setup.kind + (marketOrder ? ": market dikirim." : ": tunggu retest limit baru.")
+                    else if not riskOk
+                        riskRejected += 1
+                        lastStatus := "Ditolak: SL " + str.tostring(risk / pipSize, "#.##") + " pip, di luar batas."
+                    else if not sizingOk
+                        sizingRejected += 1
+                        lastStatus := "Ditolak: qty / split / margin di bawah minimum."
                     else
-                        lastStatus := not stopOk ? "DITOLAK: SL struktur > batas / tidak valid." : not tp1Ok ? "DITOLAK: TP1 2R lebih kecil dari minimum pip." : na(target) ? "DITOLAK: tidak ada likuiditas terkonfirmasi >= RR TP2." : not sizingOk ? "DITOLAK: qty/split di bawah step broker." : "DITOLAK: chasing / bukan diskon-premium / limit tidak konfluensi."
-                    setup := Setup.new()
+                        executionRejected += 1
+                        lastStatus := "Ditolak: chasing / limit tidak pasif / jendela berikutnya."
+                    setup := ScalpSetup.new()
 
-    // Dua bracket tetap: jangan membuat ulang reservasi TP1 setelah parsial terisi.
+    // Qty tiap leg dibekukan; TP1 tidak dibuat ulang setelah parsial terisi.
     if trade.active and not trade.closing
         float activeStop = trade.breakEven ? trade.entry : trade.initialStop
         string stopComment = trade.breakEven ? "BE harga (biaya tetap ada)" : "SL struktur"
         if trade.side == 1
             if not trade.firstLegClosed
-                strategy.exit("L-TP1", "L", qty = trade.firstQty, stop = activeStop, limit = trade.tp1, oca_name = "L-bracket-1", comment_profit = "TP1 2R", comment_loss = stopComment, alert_profit = "L TP1 terisi", alert_loss = "L " + stopComment)
-            strategy.exit("L-TP2", "L", qty = trade.runnerQty, stop = activeStop, limit = trade.tp2, oca_name = "L-bracket-2", comment_profit = "TP2 likuiditas", comment_loss = stopComment, alert_profit = "L TP2 terisi", alert_loss = "L " + stopComment)
+                strategy.exit("L-TP1", "L", qty = trade.firstQty, stop = activeStop, limit = trade.tp1, oca_name = "L-bracket-1", comment_profit = "TP1", comment_loss = stopComment, alert_profit = "L TP1 terisi", alert_loss = "L " + stopComment)
+            strategy.exit("L-TP2", "L", qty = trade.runnerQty, stop = activeStop, limit = trade.tp2, oca_name = "L-bracket-2", comment_profit = "TP2", comment_loss = stopComment, alert_profit = "L TP2 terisi", alert_loss = "L " + stopComment)
         else
             if not trade.firstLegClosed
-                strategy.exit("S-TP1", "S", qty = trade.firstQty, stop = activeStop, limit = trade.tp1, oca_name = "S-bracket-1", comment_profit = "TP1 2R", comment_loss = stopComment, alert_profit = "S TP1 terisi", alert_loss = "S " + stopComment)
-            strategy.exit("S-TP2", "S", qty = trade.runnerQty, stop = activeStop, limit = trade.tp2, oca_name = "S-bracket-2", comment_profit = "TP2 likuiditas", comment_loss = stopComment, alert_profit = "S TP2 terisi", alert_loss = "S " + stopComment)
+                strategy.exit("S-TP1", "S", qty = trade.firstQty, stop = activeStop, limit = trade.tp1, oca_name = "S-bracket-1", comment_profit = "TP1", comment_loss = stopComment, alert_profit = "S TP1 terisi", alert_loss = "S " + stopComment)
+            strategy.exit("S-TP2", "S", qty = trade.runnerQty, stop = activeStop, limit = trade.tp2, oca_name = "S-bracket-2", comment_profit = "TP2", comment_loss = stopComment, alert_profit = "S TP2 terisi", alert_loss = "S " + stopComment)
 
-bool drawSetup = showZones and setup.phase >= 3
-pOteLow = plot(drawSetup ? setup.oteLow : na, "OTE 78.6/61.8 bawah", color = color.new(color.orange, 25), style = plot.style_linebr)
-pOteHigh = plot(drawSetup ? setup.oteHigh : na, "OTE 61.8/78.6 atas", color = color.new(color.orange, 25), style = plot.style_linebr)
-fill(pOteLow, pOteHigh, color.new(color.orange, 90), "Zona OTE")
-pZoneLow = plot(drawSetup ? setup.zoneLow : na, "Konfluensi bawah", color = color.aqua, style = plot.style_linebr)
-pZoneHigh = plot(drawSetup ? setup.zoneHigh : na, "Konfluensi atas", color = color.aqua, style = plot.style_linebr)
-fill(pZoneLow, pZoneHigh, color.new(color.aqua, 83), "Konfluensi OTE")
-plot(drawSetup ? setup.sweet : na, "OTE 0.705", color = color.yellow, style = plot.style_linebr)
-plot(showZones and trade.active ? trade.entry : na, "Entry rencana / fill", color = color.white, style = plot.style_linebr)
-plot(showZones and trade.active ? (trade.breakEven ? trade.entry : trade.initialStop) : na, "SL / BEP", color = color.red, style = plot.style_linebr)
-plot(showZones and trade.active ? trade.tp1 : na, "TP1 2R", color = color.lime, style = plot.style_linebr)
-plot(showZones and trade.active ? trade.tp2 : na, "TP2 likuiditas", color = color.teal, style = plot.style_linebr)
-plotshape(buySweepMark, "Sweep SSL", shape.triangleup, location.belowbar, color.aqua, text = "SSL", size = size.tiny)
-plotshape(sellSweepMark, "Sweep BSL", shape.triangledown, location.abovebar, color.orange, text = "BSL", size = size.tiny)
-plotshape(buyMssMark, "MSS bullish", shape.circle, location.belowbar, color.lime, text = "MSS", size = size.tiny)
-plotshape(sellMssMark, "MSS bearish", shape.circle, location.abovebar, color.red, text = "MSS", size = size.tiny)
-plotshape(buyOrderMark, "Kirim buy", shape.labelup, location.belowbar, color.green, text = "BUY", textcolor = color.white, size = size.tiny)
-plotshape(sellOrderMark, "Kirim sell", shape.labeldown, location.abovebar, color.red, text = "SELL", textcolor = color.white, size = size.tiny)
-bgcolor(showSessions ? (newsNow ? color.new(color.red, 85) : f_killzone(time) ? color.new(color.blue, 94) : na) : na)
+plot(showLevels ? emaFast : na, "EMA cepat", color = color.aqua)
+plot(showLevels ? emaSlow : na, "EMA lambat", color = color.orange)
+plot(showLevels and setup.side != 0 ? setup.reference : na, "Referensi setup terkunci", color = color.yellow, style = plot.style_linebr)
+plot(showLevels and trade.active ? trade.entry : na, "Entry rencana / fill", color = color.white, style = plot.style_linebr)
+plot(showLevels and trade.active ? (trade.breakEven ? trade.entry : trade.initialStop) : na, "SL / BEP", color = color.red, style = plot.style_linebr)
+plot(showLevels and trade.active ? trade.tp1 : na, "TP1", color = color.lime, style = plot.style_linebr)
+plot(showLevels and trade.active ? trade.tp2 : na, "TP2", color = color.teal, style = plot.style_linebr)
+plotshape(buySetupMark, "Setup buy", shape.triangleup, location.belowbar, color.aqua, text = "SET", size = size.tiny)
+plotshape(sellSetupMark, "Setup sell", shape.triangledown, location.abovebar, color.orange, text = "SET", size = size.tiny)
+plotshape(buyOrderMark, "Order buy dikirim", shape.labelup, location.belowbar, color.green, text = "BUY", textcolor = color.white, size = size.tiny)
+plotshape(sellOrderMark, "Order sell dikirim", shape.labeldown, location.abovebar, color.red, text = "SELL", textcolor = color.white, size = size.tiny)
+bgcolor(showSessions ? (newsNow ? color.new(color.red, 85) : f_session(time) ? color.new(color.blue, 94) : na) : na)
 
-var table dashboard = table.new(position.top_right, 2, 16, bgcolor = color.new(color.black, 12), border_width = 1)
+var table dashboard = table.new(position.top_right, 2, 19, bgcolor = color.new(color.black, 12), border_width = 1)
 if barstate.islast and showDashboard
     float winRate = completed > 0 ? 100.0 * winners / completed : na
     float lowerBound = f_wilsonLower(winners, completed)
-    float profitFactor = losingPnl > 0 ? winningPnl / losingPnl : na
     bool evidenceStrong = completed >= minimumSample and lowerBound > 50 and winningPnl > losingPnl
     color resultColor = evidenceStrong ? color.lime : color.orange
-    string phaseText = trade.active ? (trade.filled ? "Posisi aktif" : "Order menunggu fill") : setup.phase == 0 ? "1/5 Tunggu waktu + sweep" : setup.phase == 1 ? "2/5 Tunggu MSS" : setup.phase == 2 ? "3/5 Tunggu konfirmasi FVG" : setup.phase == 3 ? "3/5 Tunggu pullback OTE" : "4/5 Tunggu rejection"
-    f_row(dashboard, 0, "ICT XAU v6", "Target WR >50%, bukan jaminan", color.yellow)
-    f_row(dashboard, 1, "Tahap", phaseText, color.white)
+    string phase = trade.active ? (trade.filled ? "Posisi aktif" : "Order menunggu fill") : setup.side != 0 ? setup.kind + ": tunggu trigger" : "Tunggu pullback / sweep baru"
+    string windowText = not calendarReviewed ? "TERKUNCI: verifikasi kalender" : time_close < calendarStart or time_close > calendarEnd ? "TERKUNCI: cakupan kalender" : newsNow ? "BLACKOUT +/-15 menit" : currentWindow ? "Sesi aktif; " + str.tostring(array.size(newsEvents)) + " berita manual" : "Di luar jendela entri"
+    f_row(dashboard, 0, "XAU Active Scalper M5/M15", "Target WR >50%, bukan jaminan", color.yellow)
+    f_row(dashboard, 1, "Tahap", phase, color.white)
     f_row(dashboard, 2, "Status terakhir", lastStatus, color.white)
-    f_row(dashboard, 3, "Waktu / berita", not calendarReviewed ? "TERKUNCI: verifikasi kalender" : time_close < calendarStart or time_close > calendarEnd ? "TERKUNCI: di luar cakupan kalender" : newsNow ? "BLACKOUT +/-15 menit" : currentWindow ? "Killzone; " + str.tostring(array.size(newsEvents)) + " berita manual" : "Di luar jendela entri", currentWindow ? color.lime : color.orange)
-    f_row(dashboard, 4, "Bias HTF", not useBias ? "Filter nonaktif" : buyBias ? "BUY" : sellBias ? "SELL" : "Netral / pemanasan EMA", color.white)
-    f_row(dashboard, 5, "Entry / SL awal", f_price(trade.entry) + " / " + f_price(trade.initialStop), color.white)
-    f_row(dashboard, 6, "TP1 / TP2", f_price(trade.tp1) + " / " + f_price(trade.tp2), color.lime)
-    f_row(dashboard, 7, "Risiko / lot standar*", trade.active ? str.tostring(trade.risk / pipSize, "#.##") + " pip / " + str.tostring(trade.qty * syminfo.pointvalue / 100, "#.###") : "-", color.white)
-    f_row(dashboard, 8, "BEP (close, bukan intrabar)", trade.breakEven ? "Aktif; belum bebas biaya/gap" : "Tunggu max(" + str.tostring(bePips) + " pip, 1R)", color.white)
-    f_row(dashboard, 9, "Posisi hari ini / net", str.tostring(dailyEntries) + "/" + str.tostring(maxTradesDay) + " / $" + str.tostring(strategy.netprofit - dayStartNet, "#.##"), color.white)
-    f_row(dashboard, 10, "Posisi utuh W / L / BE", str.tostring(winners) + " / " + str.tostring(losers) + " / " + str.tostring(completed - winners - losers), color.white)
-    f_row(dashboard, 11, "WR net / batas bawah 95%*", completed > 0 ? str.tostring(winRate, "#.##") + "% / " + str.tostring(lowerBound, "#.##") + "%" : "Belum ada posisi selesai", resultColor)
-    f_row(dashboard, 12, "Sampel / minimum", str.tostring(completed) + " / " + str.tostring(minimumSample), resultColor)
-    f_row(dashboard, 13, "Profit factor posisi utuh", losingPnl > 0 ? str.tostring(profitFactor, "#.##") : winningPnl > 0 ? "Belum ada loss" : "-", color.white)
-    f_row(dashboard, 14, "Max drawdown tester", "$" + str.tostring(strategy.max_drawdown, "#.##"), color.white)
-    f_row(dashboard, 15, "Validasi wajib", "Out-of-sample + forward test; baca README", color.yellow)
+    f_row(dashboard, 3, "Waktu / berita", windowText, currentWindow ? color.lime : color.orange)
+    f_row(dashboard, 4, "Bias / ADX / HTF", (buyBias ? "BUY" : sellBias ? "SELL" : "Netral") + " / " + str.tostring(adx, "#.0") + " / " + (useBias ? biasTf : "off"), color.white)
+    f_row(dashboard, 5, "Setup -> trigger -> order", str.tostring(setupCount) + " -> " + str.tostring(triggerCount) + " -> " + str.tostring(orderCount), color.white)
+    f_row(dashboard, 6, "Tolak SL / qty / eksekusi", str.tostring(riskRejected) + " / " + str.tostring(sizingRejected) + " / " + str.tostring(executionRejected), color.orange)
+    f_row(dashboard, 7, "Entry / SL awal", f_price(trade.entry) + " / " + f_price(trade.initialStop), color.white)
+    f_row(dashboard, 8, "TP1 / TP2", f_price(trade.tp1) + " / " + f_price(trade.tp2), color.lime)
+    f_row(dashboard, 9, "Risiko / lot standar*", trade.active ? str.tostring(trade.risk / pipSize, "#.##") + " pip / " + str.tostring(trade.qty * syminfo.pointvalue / 100, "#.###") : "-", color.white)
+    f_row(dashboard, 10, "BEP (close, bukan intrabar)", trade.breakEven ? "Aktif; bukan bebas biaya/gap" : "Tunggu " + str.tostring(beAtR, "#.##") + "R", color.white)
+    f_row(dashboard, 11, "Entry hari ini / net", str.tostring(dailyEntries) + "/" + str.tostring(maxTradesDay) + " / $" + str.tostring(strategy.netprofit - dayStartNet, "#.##"), color.white)
+    f_row(dashboard, 12, "Posisi utuh W / L / BE", str.tostring(winners) + " / " + str.tostring(losers) + " / " + str.tostring(completed - winners - losers), color.white)
+    f_row(dashboard, 13, "WR net / batas bawah 95%*", completed > 0 ? str.tostring(winRate, "#.##") + "% / " + str.tostring(lowerBound, "#.##") + "%" : "Belum ada posisi selesai", resultColor)
+    f_row(dashboard, 14, "Sampel selesai / minimum", str.tostring(completed) + " / " + str.tostring(minimumSample), resultColor)
+    f_row(dashboard, 15, "Profit factor posisi utuh", losingPnl > 0 ? str.tostring(winningPnl / losingPnl, "#.##") : winningPnl > 0 ? "Belum ada loss" : "-", color.white)
+    f_row(dashboard, 16, "Fill / hari eligible", eligibleDays > 0 ? str.tostring(totalFills) + " / " + str.tostring(eligibleDays) + " = " + str.tostring(1.0 * totalFills / eligibleDays, "#.##") + "/hari" : "Belum ada hari eligible", color.white)
+    f_row(dashboard, 17, "Max DD / pending batal", "$" + str.tostring(strategy.max_drawdown, "#.##") + " / " + str.tostring(cancelledOrders), color.white)
+    f_row(dashboard, 18, "Time exit / validasi", str.tostring(maxHoldMinutes) + " menit; wajib OOS + forward test", color.yellow)

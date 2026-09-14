@@ -1,4 +1,4 @@
-"""Reference-contract tests for ``ict_xauusd_v6.pine``.
+"""Reference-contract tests for the preserved strict ICT strategy.
 
 These dependency-free tests model the documented financial and timing rules and
 check focused Pine source contracts.  They do not compile Pine Script, execute
@@ -16,7 +16,7 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
-PINE_PATH = ROOT / "ict_xauusd_v6.pine"
+PINE_PATH = ROOT / "strategies" / "ict_strict_v6.pine"
 
 PIP = Decimal("0.10")
 TICK = Decimal("0.01")
