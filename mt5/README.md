@@ -1,5 +1,8 @@
 # Super Scalper EA untuk MetaTrader 5
 
+**Pemula: mulai dari [PANDUAN-LANGKAH-DEMI-LANGKAH.md](PANDUAN-LANGKAH-DEMI-LANGKAH.md)** — urutan download,
+kompilasi, pemasangan, pengisian setting, arti status di chart, dan pengujian demo.
+
 Salin **seluruh folder [`SuperScalper`](SuperScalper)** ke `MQL5/Experts/` melalui **File → Open Data Folder** di MT5.
 Buka `SuperScalperEA.mq5` di MetaEditor lalu tekan **F7**. Semua berkas `.mqh` harus tetap berada di folder yang sama.
 EA ini untuk **MT5 desktop**, bukan MT4/mobile. Pilihan volume hanya **0,05 atau 0,10 lot**.
